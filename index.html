@@ -309,7 +309,7 @@ function v1Params(j){
     if (f === 'tsubaki3' && p.palette) par.colorPalette = p.palette;
   }
   if (f === 'tsubaki3' && p.profile) par.inferenceProfile = p.profile;
-  if (hasPriority(p)) par.priority = +p.priority;
+  if (hasPriority(p)) par.priority = effPriority(p);
   if (f === 'sdxl'){
     if (p.sampler) par.samplingMethod = p.sampler; if (p.steps) par.samplingSteps = +p.steps; if (p.cfg) par.cfgScale = +p.cfg;
     if (hasCn(p)) par.controlNets = p.cn.filter(c => c.mediaId).slice(0, 10).map(c => ({type:c.type, mediaId:c.mediaId, weight:c.weight === '' || c.weight == null || isNaN(+c.weight) ? 1 : +c.weight}));   // 0은 유효한 값
@@ -362,12 +362,20 @@ async function gql(query, variables){
   if (js && js.errors && js.errors.length) throw new Error(js.errors[0].message);
   return js.data;
 }
-let BAL = null, ME = null, balT = 0;
+let BAL = null, ME = null, MEMBER = null, balT = 0, balSeq = 0;   // MEMBER: 멤버십 여부(me.membership.tier > 0) · null = 모름(브라우저판 등)
+// 키를 바꾸면 계정 상태를 비운다(이전 계정의 멤버십이 새 계정에 남지 않게)
+function resetAccount(){ BAL = null; ME = null; MEMBER = null; MYLORAS = null; balSeq++; }
 async function refreshBal(){
   if (!DESK || MOCK || !S.key) return;
-  try { const d = await gql('{ me { id quotaAmount } }'); BAL = d.me.quotaAmount; ME = d.me.id; }
-  catch (e){ BAL = null; console.warn('잔액 조회 실패', e); }
+  const seq = ++balSeq, was = MEMBER;
+  try {
+    const d = await gql('{ me { id quotaAmount membership { membershipId tier } } }');
+    if (seq !== balSeq) return;   // 더 나중 조회(또는 키 변경)가 있으면 늦게 온 응답은 버린다
+    BAL = d.me.quotaAmount; ME = d.me.id; MEMBER = !!(d.me.membership && d.me.membership.tier > 0);
+  }
+  catch (e){ if (seq !== balSeq) return; BAL = null; MEMBER = null; console.warn('잔액 조회 실패', e); }   // 모르면 자동 = 높은 우선순위(비싸도 확실한 쪽)
   renderCost();
+  if (was !== MEMBER && (TAB === 'gen' || TAB === 'pack')) render();   // 자동 우선순위가 바뀌므로 가격 배지 갱신
 }
 const refreshBalSoon = () => { clearTimeout(balT); balT = setTimeout(refreshBal, 3000); };
 // 공식 팔레트 프리셋·Tsubaki.3 스타일 키 목록. 실패해도 앱은 돈다(목록만 비거나 기본 목록).
@@ -469,16 +477,26 @@ function isRelay(p){ return S.relayOn && fam(p) === 'tsubaki3' && +p.batch === 1
 // 무제한 레인은 자기 대기열을 쓰므로 우선순위가 걸려 있어도 레인이 먼저다.
 // Tsubaki.2의 모드·스타일은 v2 필드라 v1로 넘기면 빠진다 → 그 조합에선 우선순위를 걸지 않는다(v1 대응 필드 미실측)
 const t2Locked = p => fam(p) === 'tsubaki2' && !!(p.mode || p.style);
-const hasPriority = p => p.priority !== '' && p.priority != null && !t2Locked(p);
+// 실제로 보낼 우선순위. '' = 자동: 멤버십이면 터보(500 · 추가 비용 없음), 아니면 생략(= 서버 기본 높은 우선순위 1000 · 추가 비용).
+// 자동은 헬퍼를 켰으면 쓰지 않는다(v1으로 넘어가면 헬퍼가 빠짐). null = 필드를 보내지 않음.
+function effPriority(p){
+  if (t2Locked(p) || p.priority === 'omit') return null;   // 'omit' = 큐에 넣을 때 「보내지 않음」으로 고정된 자동값
+  if (p.priority === '' || p.priority == null) return MEMBER && p.helper !== 'enable' ? 500 : null;
+  return +p.priority;
+}
+const hasPriority = p => effPriority(p) != null;
 function routeOf(p){ return needsV1(p) ? 'v1' : isRelay(p) ? 'relay' : hasPriority(p) ? 'v1' : 'v2'; }
 function plan(prompt, p, meta){
   const via = routeOf(p);
   const [w, hh] = dims(p, via === 'relay');
   const n = Math.max(1, Math.min(100, +p.count || 1));
+  // 자동 우선순위는 여기서 값으로 고정한다 — 승인(가격 확인) 뒤 멤버십 상태가 바뀌어도 대기 중 작업이 다른 가격으로 나가지 않게
+  const pp = clone(p);
+  if (pp.priority === '' || pp.priority == null){ const ep = effPriority(p); pp.priority = ep == null ? 'omit' : String(ep); }
   const out = [];
   for (let i = 0; i < n; i++){
     const seed = String(p.seed).trim() !== '' ? (parseInt(p.seed, 10) + i) : randSeed();
-    out.push(Object.assign({prompt, p:clone(p), seed, via, w, h:hh}, meta));
+    out.push(Object.assign({prompt, p:clone(pp), seed, via, w, h:hh}, meta));
   }
   return out;
 }
@@ -625,8 +643,14 @@ function paramsForm(p, onChange, opts = {}){
         h('div', {}, h('label', {class:'f'}, '시드 (비우면 무작위)'), h('input', {type:'text', value:p.seed, placeholder:'무작위', oninput:e => { p.seed = e.target.value.replace(/[^\d]/g, ''); e.target.value = p.seed; ch(); }})),
         h('div', {}, h('label', {class:'f'}, '프롬프트 헬퍼'), sel(p.helper, [['disable', '끔'], ['enable', '켬']], v => p.helper = v))),
       t2Locked(p)
-        ? h('div', {class:'faint'}, '우선순위(터보·저속)는 Tsubaki.2의 모드·스타일과 같이 쓸 수 없어 기본으로 나갑니다.')
-        : h('div', {}, h('label', {class:'f'}, '우선순위 (PixAI 대기열)'), sel(hasPriority(p) ? String(p.priority) : '', [['', '기본 (1000)'], ['500', '터보 (500 · 멤버십 할인)'], ['0', '저속 (0 · 싸지만 대기 김)']], v => p.priority = v)),
+        ? h('div', {class:'faint'}, '우선순위는 Tsubaki.2의 모드·스타일과 같이 쓸 수 없어 높은 우선순위(기본)로 나갑니다.')
+        : h('div', {}, h('label', {class:'f'}, '우선순위 (PixAI 대기열 · 공식 설명 기준)'),
+            sel(p.priority == null || p.priority === 'omit' ? '' : String(p.priority), [
+              ['', '자동 — ' + (MEMBER ? (p.helper === 'enable' ? '헬퍼 켬이라 높은 우선순위' : '멤버십이라 터보') : MEMBER === false ? '비회원이라 높은 우선순위' : '계정 확인 전 · 높은 우선순위')],
+              ['1000', '높은 우선순위 (최대 10배 · 추가 비용)'],
+              ['500', '터보 (최대 7.6배 · 멤버십 전용 · 추가 비용 없음)'],
+              ['0', '낮은 우선순위 (수십 분 대기 · 추가 비용 없음)']], v => p.priority = v),
+            MEMBER === false && String(p.priority) === '500' ? h('div', {class:'faint', style:'color:var(--warn)'}, '터보는 멤버십 전용입니다. 비회원 계정은 낮은 우선순위로 처리될 수 있습니다(미확인).') : ''),
       p.helper === 'enable' && routeOf(p) !== 'v2' ? h('div', {class:'faint', style:'color:var(--warn)'}, '지금 설정은 v1 경로로 나가서 프롬프트 헬퍼가 적용되지 않습니다.') : '',
     );
     if (f === 'tsubaki2') box.append(h('div', {}, h('label', {class:'f'}, '모드 (Tsubaki.2)'), sel(p.mode, [['', '기본'], ['lite', 'lite'], ['standard', 'standard'], ['pro', 'pro'], ['ultra', 'ultra']], v => p.mode = v)));
@@ -719,7 +743,7 @@ function paramsForm(p, onChange, opts = {}){
         const one = await priceJobs([plan('x', p, {})[0]]), n = Math.max(1, +p.count || 1);
         // 예상 대기(GET /v2/task/wait-time · 우선순위별). 실패해도 가격만 보여 준다
         let wait = '';
-        try { const w = await http(API + '/v2/task/wait-time?priority=' + (hasPriority(p) ? +p.priority : 1000) + '&modelVersionId=' + encodeURIComponent(modelId(p)), {headers:auth()});
+        try { const w = await http(API + '/v2/task/wait-time?priority=' + (hasPriority(p) ? effPriority(p) : 1000) + '&modelVersionId=' + encodeURIComponent(modelId(p)), {headers:auth()});
           const sec = +w.waitDurationSeconds; if (!isNaN(sec)) wait = ' · 대기 약 ' + (sec < 60 ? Math.max(1, Math.round(sec)) + '초' : Math.round(sec / 60) + '분'); } catch {}
         badge.textContent = one == null ? rl + ' · 가격표 조회 실패' + wait : `${rl} · 1건 ${one.toLocaleString()} 크레딧` + (n > 1 ? ` · ${n}건 ${(one * n).toLocaleString()}` : '') + wait;
       }, 350);
@@ -1132,7 +1156,7 @@ function openLB(rec, hist){
         ? (rec.tool ? h('button', {class:'sm nf', onclick:() => { close(); enqueue([Object.assign(toolJob(rec, rec.kind, clone(rec.tool), '다시'), {label:rec.label})]); }}, '같은 편집 다시') : null)
         : [h('button', {class:'sm nf', onclick:() => { const p = Object.assign(defParams(), clone(rec.params || {})); p.seed = String(rec.seed); p.count = 1; enqueue(plan(rec.prompt, p, {source:rec.source, projectId:rec.projectId, cellKey:rec.cellKey, label:rec.label})); }}, '같은 시드로 다시'),
           h('button', {class:'sm nf', onclick:() => { const p = Object.assign(defParams(), clone(rec.params || {})); p.seed = ''; p.count = 1; enqueue(plan(rec.prompt, p, {source:rec.source, projectId:rec.projectId, cellKey:rec.cellKey, label:rec.label})); }}, '새 시드로 다시')],
-      h('button', {class:'sm nf', onclick:() => { SINGLE.prompt = rec.prompt; SINGLE.params = Object.assign(defParams(), clone(rec.params || {})); SINGLE.params.seed = String(rec.seed); saveAll(); close(); go('gen'); }}, '단일 생성으로 불러오기')),
+      h('button', {class:'sm nf', onclick:() => { SINGLE.prompt = rec.prompt; SINGLE.params = Object.assign(defParams(), clone(rec.params || {})); SINGLE.params.seed = String(rec.seed); if (SINGLE.params.priority === 'omit') SINGLE.params.priority = ''; saveAll(); close(); go('gen'); }}, '단일 생성으로 불러오기')),
     h('div', {class:'row', style:'gap:6px;margin-top:6px'},
       h('button', {class:'sm nf', disabled:!rec.mediaId || null, title:rec.mediaId ? '' : 'mediaId 없음', onclick:() => { const p = toForm(); if (p.refs.length >= 3){ alert('레퍼런스는 최대 3장'); return; } if (p.refs.some(r => r.mediaId === rec.mediaId)) return; p.refs.push({mediaId:rec.mediaId}); saveAll(); close(); render(); }}, '레퍼런스로'),
       h('button', {class:'sm nf', disabled:!rec.mediaId || null, title:rec.mediaId ? '이 이미지를 원본으로 다시 그리기' : 'mediaId 없음', onclick:() => { const p = toForm(); p.i2i = {mediaId:rec.mediaId}; saveAll(); close(); render(); }}, 'i2i 원본으로'),
@@ -1351,7 +1375,7 @@ function viewSettings(){
     const k = keyIn.value.trim();
     if (!k && !KEY_LOADED){ res.textContent = '저장된 키를 불러오지 못한 상태라 지우지 않았습니다. 키를 넣고 저장하면 덮어씁니다'; return; }
     if (!papi() || !(await papi().save_key(k))){ res.textContent = '저장 실패'; return; }
-    S.key = k; KEY_LOADED = true; refreshBal(); res.textContent = k ? '저장됨 · 다음 실행부터 자동으로 불러옵니다' : '저장된 키를 지웠습니다';
+    S.key = k; KEY_LOADED = true; resetAccount(); renderCost(); refreshBal(); res.textContent = k ? '저장됨 · 다음 실행부터 자동으로 불러옵니다' : '저장된 키를 지웠습니다';
   };
   return h('div', {class:'stack', style:'max-width:900px'},
     h('div', {class:'card stack'}, h('h3', {}, 'API 키'),
