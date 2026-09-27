@@ -981,11 +981,19 @@ function matrixTable(){
 }
 let PV = lsGet('pxs.pv', 'card');   // 씬 팩 보기: card | matrix
 let packRedraw = null;               // 큐 진행에 맞춰 씬 영역만 다시 그린다(편집 중인 입력칸은 건드리지 않게)
+// 씬 팩 예상 금액: 한 칸을 PixAI 가격표로 재서 칸 수만큼 곱한다(우선순위·옵션 반영). 못 재면 실측 단가로 어림
+const PACK_PRICE = new Map();   // v1 parameters(시드·프롬프트 뺀 것) → 1건 가격 · null = 조회 중 · undefined = 실패
+let PACK_UPD = null;
 function packEst(pj, cells){
-  const p = pj.params, imgs = cells * Math.max(1, +p.count || 1) * (+p.batch || 1);
+  const p = pj.params, n = cells * Math.max(1, +p.count || 1), imgs = n * (+p.batch || 1);
   if (isRelay(p)) return `${imgs}장 · 무제한 레인`;
-  const u = modelOf(p).unit;
-  return `${imgs}장 · ` + (u ? `약 ${(u * imgs).toLocaleString()} 크레딧` : '유료');
+  const u = modelOf(p).unit, rough = `${imgs}장 · ` + (u ? `약 ${(u * imgs).toLocaleString()} 크레딧` : '유료');
+  if (MOCK || !S.key || !cells) return rough;
+  const j = plan('x', p, {})[0], par = v1Params(j); delete par.seed; delete par.prompts;
+  const key = JSON.stringify(par);
+  if (!PACK_PRICE.has(key)){ PACK_PRICE.set(key, null); priceJobs([j]).then(v => { PACK_PRICE.set(key, v == null ? undefined : v); if (PACK_UPD) PACK_UPD(); }); }
+  const one = PACK_PRICE.get(key);
+  return one ? `${imgs}장 · ${(one * n).toLocaleString()} 크레딧` : one === null ? `${imgs}장 · 가격 확인 중…` : rough;
 }
 function projAction(v, pj){
   if (v === 'new'){ const n = prompt('새 프로젝트 이름', '프로젝트' + (PROJECTS.length + 1)); if (!n) return; const np = newProject(n); PROJECTS.push(np); CUR = np.id; }
@@ -1094,6 +1102,7 @@ function viewPack(){
     charBtn.textContent = fc ? `「${fc.name}」만 생성 · ${ss.length}칸` : '캐릭터 없음';
     charBtn.disabled = !(fc && ss.length) || null;
   };
+  PACK_UPD = updCount;
   genBtn.onclick = () => enqueue(packJobs(pj, pj.chars.filter(c => c.on), pj.scenes.filter(s => s.on)));
   charBtn.onclick = () => { const fc = pj.chars.find(c => c.id === pj.focus); if (fc) enqueue(packJobs(pj, [fc], pj.scenes.filter(s => s.on))); };
 
