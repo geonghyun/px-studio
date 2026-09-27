@@ -60,20 +60,50 @@ DATA_DIR, PORTABLE = _pick_data_dir()
 
 def _migrate_legacy():
     """휴대용 폴더가 처음이면 예전 %APPDATA%\\PXStudio 데이터를 한 번 복사해 온다(원본은 남긴다).
-    port.txt까지 가져와야 같은 포트(=같은 저장소 출처)로 떠서 갤러리·설정이 보인다."""
+    port.txt까지 가져와야 같은 포트(=같은 저장소 출처)로 떠서 갤러리·설정이 보인다.
+    프로필은 임시 폴더로 통째 복사한 뒤 성공했을 때만 제자리로 옮긴다. 실패하면 False —
+    그 실행은 예전 폴더를 그대로 쓰고(휴대용 폴더에 빈 프로필을 만들지 않음) 다음 실행에서 다시 시도한다."""
     import shutil
     if not PORTABLE or os.path.exists(os.path.join(DATA_DIR, "webview")) or not os.path.isdir(LEGACY_DIR):
-        return
-    for name in ("key.bin", "port.txt"):
-        src = os.path.join(LEGACY_DIR, name)
-        if os.path.isfile(src) and not os.path.exists(os.path.join(DATA_DIR, name)):
-            shutil.copy2(src, os.path.join(DATA_DIR, name))
+        return True
     src = os.path.join(LEGACY_DIR, "webview")
-    if os.path.isdir(src):
-        try:
-            shutil.copytree(src, os.path.join(DATA_DIR, "webview"))
-        except (OSError, shutil.Error):
-            pass   # 예전 창이 켜져 있어 잠긴 파일이 있으면 복사된 만큼만 쓴다(원본은 그대로)
+    part = os.path.join(DATA_DIR, "webview.migrating")
+    # 키·포트도 임시 이름으로 받아 두고 프로필이 제자리에 들어간 뒤에만 확정한다.
+    # (실패한 시도의 키가 남으면, 그 실행에서 AppData 쪽 키를 바꿔도 다음 이전 때 옛 키가 이긴다)
+    # 프로필(webview) 확정이 맨 마지막 단계 = 「이전 완료」 표시. 그 전에 실패하면 이번 시도에서 만든 것을 전부 되돌려
+    # 다음 실행이 처음부터 다시 시도하게 한다.
+    temps, done = [], []
+    try:
+        if os.path.isdir(src):
+            if os.path.exists(part):
+                shutil.rmtree(part)
+            shutil.copytree(src, part)   # 예전 창이 켜져 있어 잠긴 파일이 있으면 여기서 실패
+        for name in ("key.bin", "port.txt"):
+            s, d = os.path.join(LEGACY_DIR, name), os.path.join(DATA_DIR, name)
+            if os.path.isfile(s) and not os.path.exists(d):
+                shutil.copy2(s, d + ".migrating")
+                temps.append((d + ".migrating", d))
+        for t, d in temps:
+            os.replace(t, d)
+            done.append(d)
+        if os.path.isdir(part):
+            os.replace(part, os.path.join(DATA_DIR, "webview"))
+        return True
+    except (OSError, shutil.Error):
+        shutil.rmtree(part, ignore_errors=True)
+        for f in [t for t, _ in temps] + done:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return False
+
+
+def _use_data_dir(d, portable):
+    global DATA_DIR, PORTABLE, KEY_FILE, PORT_FILE
+    DATA_DIR, PORTABLE = d, portable
+    KEY_FILE = os.path.join(d, "key.bin")
+    PORT_FILE = os.path.join(d, "port.txt")
 
 
 KEY_FILE = os.path.join(DATA_DIR, "key.bin")
@@ -287,7 +317,9 @@ def bind_server():
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
-    _migrate_legacy()   # 포트 파일을 읽기 전에(bind_server) 가져와야 예전 저장소 출처가 이어진다
+    # 포트 파일을 읽기 전에(bind_server) 가져와야 예전 저장소 출처가 이어진다. 이전 실패면 이번엔 예전 폴더로 뜬다
+    if not _migrate_legacy():
+        _use_data_dir(LEGACY_DIR, False)
     srv, shared = bind_server()
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()

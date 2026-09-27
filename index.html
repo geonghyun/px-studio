@@ -209,7 +209,7 @@ function sanitize(s){ return String(s).replace(/[\\/:*?"<>|\s]+/g, '_').slice(0,
 /* ───────────── 상태 ───────────── */
 const S = Object.assign({key:'', conc:4, pollMs:2000, timeoutMin:30, relayOn:false, relayUrl:'http://127.0.0.1:8765', autosave:false}, lsGet('pxs.settings', {}));
 let LORAS = lsGet('pxs.loras', DEFAULT_LORAS);
-const defParams = () => ({model:MODELS[0].id, custom:'', aspect:'1:1', size:'1k', batch:1, count:1, seed:'', helper:'disable', mode:'', style:'', styleCustom:'', sampler:'', steps:'', cfg:'', negative:'', loras:[], refs:[], i2i:null, i2iStr:0.55, profile:'', sizeW:1408, sizeH:1408, palette:null});
+const defParams = () => ({model:MODELS[0].id, custom:'', aspect:'1:1', size:'1k', batch:1, count:1, seed:'', helper:'disable', mode:'', style:'', styleCustom:'', sampler:'', steps:'', cfg:'', negative:'', loras:[], refs:[], i2i:null, i2iStr:0.55, profile:'', sizeW:1408, sizeH:1408, palette:null, priority:''});
 let SINGLE = Object.assign({prompt:'', params:defParams()}, lsGet('pxs.single', {}));
 SINGLE.params = Object.assign(defParams(), SINGLE.params || {});
 let PROJECTS = lsGet('pxs.projects', null);
@@ -309,6 +309,7 @@ function v1Params(j){
     if (f === 'tsubaki3' && p.palette) par.colorPalette = p.palette;
   }
   if (f === 'tsubaki3' && p.profile) par.inferenceProfile = p.profile;
+  if (hasPriority(p)) par.priority = +p.priority;
   if (f === 'sdxl'){
     if (p.sampler) par.samplingMethod = p.sampler; if (p.steps) par.samplingSteps = +p.steps; if (p.cfg) par.cfgScale = +p.cfg;
     if (hasCn(p)) par.controlNets = p.cn.filter(c => c.mediaId).slice(0, 10).map(c => ({type:c.type, mediaId:c.mediaId, weight:c.weight === '' || c.weight == null || isNaN(+c.weight) ? 1 : +c.weight}));   // 0은 유효한 값
@@ -318,7 +319,7 @@ function v1Params(j){
 function v1Body(j){
   if (j.kind && j.kind !== 'gen') return {parameters:j.tool};
   const par = v1Params(j);
-  if (j.via === 'relay'){ par.lane = 'infinite'; par.inferenceProfile = 'pro'; par.batchSize = 1; delete par.modelStyle; delete par.colorPalette; }
+  if (j.via === 'relay'){ par.lane = 'infinite'; par.inferenceProfile = 'pro'; par.batchSize = 1; delete par.modelStyle; delete par.colorPalette; delete par.priority; }
   return {parameters:par};
 }
 const api = {
@@ -464,7 +465,12 @@ const CN_TYPES = ['canny', 'depth', 'openpose', 'openpose_full'];   // SDXL 허�
 // 무제한 레인 조건: Tsubaki.3 · 배치 1 · 레퍼런스·i2i 없음 (패스는 text to image만 받는다)
 function isRelay(p){ return S.relayOn && fam(p) === 'tsubaki3' && +p.batch === 1 && !p.refs.length && !needsV1(p); }
 // 경로: relay = v1 무제한 레인 · v1 = v1 유료 · v2 = v2 유료
-function routeOf(p){ return needsV1(p) ? 'v1' : isRelay(p) ? 'relay' : 'v2'; }
+// 우선순위(v1 priority · 웹 번들 enum default 1000 · turboMode 500 · low 0). v2 본문에는 필드가 없어 v1로 보낸다.
+// 무제한 레인은 자기 대기열을 쓰므로 우선순위가 걸려 있어도 레인이 먼저다.
+// Tsubaki.2의 모드·스타일은 v2 필드라 v1로 넘기면 빠진다 → 그 조합에선 우선순위를 걸지 않는다(v1 대응 필드 미실측)
+const t2Locked = p => fam(p) === 'tsubaki2' && !!(p.mode || p.style);
+const hasPriority = p => p.priority !== '' && p.priority != null && !t2Locked(p);
+function routeOf(p){ return needsV1(p) ? 'v1' : isRelay(p) ? 'relay' : hasPriority(p) ? 'v1' : 'v2'; }
 function plan(prompt, p, meta){
   const via = routeOf(p);
   const [w, hh] = dims(p, via === 'relay');
@@ -618,6 +624,10 @@ function paramsForm(p, onChange, opts = {}){
         h('div', {}, h('label', {class:'f'}, opts.countLabel || '반복 횟수'), h('input', {type:'number', min:1, max:100, value:p.count, oninput:e => { p.count = e.target.value; ch(); }})),
         h('div', {}, h('label', {class:'f'}, '시드 (비우면 무작위)'), h('input', {type:'text', value:p.seed, placeholder:'무작위', oninput:e => { p.seed = e.target.value.replace(/[^\d]/g, ''); e.target.value = p.seed; ch(); }})),
         h('div', {}, h('label', {class:'f'}, '프롬프트 헬퍼'), sel(p.helper, [['disable', '끔'], ['enable', '켬']], v => p.helper = v))),
+      t2Locked(p)
+        ? h('div', {class:'faint'}, '우선순위(터보·저속)는 Tsubaki.2의 모드·스타일과 같이 쓸 수 없어 기본으로 나갑니다.')
+        : h('div', {}, h('label', {class:'f'}, '우선순위 (PixAI 대기열)'), sel(hasPriority(p) ? String(p.priority) : '', [['', '기본 (1000)'], ['500', '터보 (500 · 멤버십 할인)'], ['0', '저속 (0 · 싸지만 대기 김)']], v => p.priority = v)),
+      p.helper === 'enable' && routeOf(p) !== 'v2' ? h('div', {class:'faint', style:'color:var(--warn)'}, '지금 설정은 v1 경로로 나가서 프롬프트 헬퍼가 적용되지 않습니다.') : '',
     );
     if (f === 'tsubaki2') box.append(h('div', {}, h('label', {class:'f'}, '모드 (Tsubaki.2)'), sel(p.mode, [['', '기본'], ['lite', 'lite'], ['standard', 'standard'], ['pro', 'pro'], ['ultra', 'ultra']], v => p.mode = v)));
     if (f === 'tsubaki2' || f === 'tsubaki3'){
@@ -707,7 +717,11 @@ function paramsForm(p, onChange, opts = {}){
       clearTimeout(PRICE_T);
       PRICE_T = setTimeout(async () => {
         const one = await priceJobs([plan('x', p, {})[0]]), n = Math.max(1, +p.count || 1);
-        badge.textContent = one == null ? rl + ' · 가격표 조회 실패' : `${rl} · 1건 ${one.toLocaleString()} 크레딧` + (n > 1 ? ` · ${n}건 ${(one * n).toLocaleString()}` : '');
+        // 예상 대기(GET /v2/task/wait-time · 우선순위별). 실패해도 가격만 보여 준다
+        let wait = '';
+        try { const w = await http(API + '/v2/task/wait-time?priority=' + (hasPriority(p) ? +p.priority : 1000) + '&modelVersionId=' + encodeURIComponent(modelId(p)), {headers:auth()});
+          const sec = +w.waitDurationSeconds; if (!isNaN(sec)) wait = ' · 대기 약 ' + (sec < 60 ? Math.max(1, Math.round(sec)) + '초' : Math.round(sec / 60) + '분'); } catch {}
+        badge.textContent = one == null ? rl + ' · 가격표 조회 실패' + wait : `${rl} · 1건 ${one.toLocaleString()} 크레딧` + (n > 1 ? ` · ${n}건 ${(one * n).toLocaleString()}` : '') + wait;
       }, 350);
     }
   };
@@ -870,11 +884,15 @@ const SETKIND = {
   char:{label:'캐릭터', ext:'pxchars', sets:() => CHARSETS, put:v => { CHARSETS = v; }, list:pj => pj.chars, assign:(pj, l) => { pj.chars = l; }},
 };
 // 함수 선언(호이스팅): 앱 시작 때 저장된 모음을 읽는 normSets가 이보다 먼저 돈다
-function cleanItems(arr){ return (Array.isArray(arr) ? arr : []).filter(x => x && typeof x.name === 'string').slice(0, 500).map(x => ({name:x.name.slice(0, 80), prompt:String(x.prompt || '')})); }
+// 형식만 거른다(개수·길이는 자르지 않는다 — 저장한 것이 재시작 때 잘리면 데이터 손실)
+function cleanItems(arr){ return (Array.isArray(arr) ? arr : []).filter(x => x && typeof x.name === 'string').map(x => ({name:x.name, prompt:String(x.prompt || '')})); }
 // 받는 파일: 모음 파일(.pxscenes/.pxchars.json) · 프로젝트 파일(.pxproject.json → 그 안의 씬/캐릭터) · 「이름 | 프롬프트」 한 줄씩 쓴 txt
 function parseSetFile(text, fname, kind){
   const base = fname.replace(/\.(pxscenes|pxchars|pxproject)?\.?(json|txt)$/i, '') || '불러온 ' + SETKIND[kind].label;
   let js = null; try { js = JSON.parse(text); } catch {}
+  // .json이거나 JSON처럼 시작하는데 못 읽으면 txt로 넘기지 않는다(깨진 파일 원문이 프롬프트로 들어가는 것 방지)
+  // .txt는 첫 글자로 판단하지 않는다(「[미소] | …」 같은 정상 줄)
+  if (!js && (/\.json$/i.test(fname) || (!/\.txt$/i.test(fname) && /^\s*[\[{]/.test(text)))) throw new Error('손상된 JSON 파일');
   if (js){
     if (js.type === 'pxstudio-set' && js.kind && js.kind !== kind) throw new Error(`${js.kind === 'scene' ? '씬' : '캐릭터'} 모음 파일입니다`);
     const items = cleanItems(js.items || (kind === 'scene' ? js.scenes : js.chars));
