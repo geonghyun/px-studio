@@ -1328,10 +1328,10 @@ function viewSettings(){
       h('td', {style:'width:34px'}, h('button', {class:'sm danger', onclick:() => { LORAS.splice(i, 1); saveAll(); render(); }}, '×')))));
   const keyIn = h('input', {type:'password', value:S.key, placeholder:'PixAI API 키', autocomplete:'off',
     oninput:DESK ? () => { res.textContent = '저장 안 됨'; } : e => { S.key = e.target.value.trim(); saveSoon(); }});
-  if (DESK && !KEY_LOADED) res.textContent = '저장된 키를 불러오지 못했습니다. 앱을 다시 켜 주세요';
+  if (DESK && !KEY_LOADED) res.textContent = '저장된 키를 불러오지 못했습니다. 다른 PC에서 가져온 폴더라면 키를 다시 넣고 저장하세요';
   const saveKey = async () => {
     const k = keyIn.value.trim();
-    if (!k && !KEY_LOADED){ res.textContent = '저장된 키를 불러오지 못한 상태라 지우지 않았습니다. 앱을 다시 켜 주세요'; return; }
+    if (!k && !KEY_LOADED){ res.textContent = '저장된 키를 불러오지 못한 상태라 지우지 않았습니다. 키를 넣고 저장하면 덮어씁니다'; return; }
     if (!papi() || !(await papi().save_key(k))){ res.textContent = '저장 실패'; return; }
     S.key = k; KEY_LOADED = true; refreshBal(); res.textContent = k ? '저장됨 · 다음 실행부터 자동으로 불러옵니다' : '저장된 키를 지웠습니다';
   };
@@ -1341,7 +1341,7 @@ function viewSettings(){
         DESK ? h('button', {class:'nf', onclick:saveKey}, '저장') : null,
         h('button', {class:'nf', onclick:async () => { res.textContent = '확인 중…'; res.textContent = await api.checkKey(keyIn.value.trim()); }}, '키 확인'), res),
       h('div', {class:'note'}, DESK
-        ? '「저장」을 누르면 키가 이 PC의 현재 윈도우 계정으로 암호화돼 %APPDATA%\\PXStudio에 저장되고, 다음 실행부터 자동으로 불러옵니다. PixAI 서버 외 어디에도 보내지 않습니다. 칸을 비우고 저장하면 지워집니다. 키 발급: pixai.art 프로필 → API (멤버십은 즉시 발급, 그 외는 신청 후 승인).'
+        ? '「저장」을 누르면 키가 이 PC의 현재 윈도우 계정으로 암호화돼 exe 옆 PXStudio_data 폴더에 저장되고, 다음 실행부터 자동으로 불러옵니다. 폴더째 다른 PC로 옮기면 키만 다시 넣어야 합니다.PixAI 서버 외 어디에도 보내지 않습니다. 칸을 비우고 저장하면 지워집니다. 키 발급: pixai.art 프로필 → API (멤버십은 즉시 발급, 그 외는 신청 후 승인).'
         : '키는 이 브라우저(localStorage)에만 저장되고 PixAI 서버 외 어디에도 보내지 않습니다. 공용 PC에서는 쓰고 나서 지우세요. 키 발급: pixai.art 프로필 → API (멤버십은 즉시 발급, 그 외는 신청 후 승인).')),
     h('div', {class:'card stack'}, h('h3', {}, '큐'),
       h('div', {class:'row'},

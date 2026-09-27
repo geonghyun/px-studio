@@ -6,7 +6,8 @@
   - 중계는 파이썬에서 나가므로 CORS 제한이 없다 → 무제한 패스(v1 lane=infinite)와 이미지 업로드가 별도 릴레이 없이 된다
   - 로컬 서버는 실행마다 새 토큰을 요구한다(다른 프로그램·웹페이지가 이 포트를 두드려도 키를 못 쓰게)
   - 폴더·저장 대화상자는 pywebview js_api(pick_folder·save_file·open_folder)
-  - API 키는 「저장」을 누르면 %APPDATA%\\PXStudio\\key.bin 에 DPAPI로 암호화해 두고 실행 때 자동으로 불러온다(get_key·save_key)
+  - 데이터(설정·갤러리·키·포트)는 exe 옆 PXStudio_data 폴더에 둔다. 쓸 수 없는 자리면 %APPDATA%\\PXStudio
+  - API 키는 「저장」을 누르면 그 폴더의 key.bin 에 DPAPI로 암호화해 두고 실행 때 자동으로 불러온다(get_key·save_key)
 
 빌드:  .venv\\Scripts\\pyinstaller PXStudio.spec   (결과: dist\\PXStudio.exe)
 개발 실행: .venv\\Scripts\\python app.py
@@ -35,7 +36,44 @@ ALLOW = ("/v1/task", "/v1/media/upload", "/v2/image/create", "/v2/task", "/graph
          "/v2/gen-task/inpaint")
 TOKEN = secrets.token_urlsafe(24)
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "PXStudio")
+LEGACY_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "PXStudio")
+
+
+def _pick_data_dir():
+    """데이터는 exe 옆 PXStudio_data 폴더에 둔다(폴더째 옮기면 설정·갤러리가 따라간다 · 성현님 요청 2026-09-27).
+    그 자리에 쓸 수 없으면(예: Program Files) 예전 위치 %APPDATA%\\PXStudio 를 쓴다. 반환: (경로, 휴대용 여부)"""
+    exe_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    d = os.path.join(exe_dir, "PXStudio_data")
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".write_test")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return d, True
+    except OSError:
+        return LEGACY_DIR, False
+
+
+DATA_DIR, PORTABLE = _pick_data_dir()
+
+
+def _migrate_legacy():
+    """휴대용 폴더가 처음이면 예전 %APPDATA%\\PXStudio 데이터를 한 번 복사해 온다(원본은 남긴다).
+    port.txt까지 가져와야 같은 포트(=같은 저장소 출처)로 떠서 갤러리·설정이 보인다."""
+    import shutil
+    if not PORTABLE or os.path.exists(os.path.join(DATA_DIR, "webview")) or not os.path.isdir(LEGACY_DIR):
+        return
+    for name in ("key.bin", "port.txt"):
+        src = os.path.join(LEGACY_DIR, name)
+        if os.path.isfile(src) and not os.path.exists(os.path.join(DATA_DIR, name)):
+            shutil.copy2(src, os.path.join(DATA_DIR, name))
+    src = os.path.join(LEGACY_DIR, "webview")
+    if os.path.isdir(src):
+        try:
+            shutil.copytree(src, os.path.join(DATA_DIR, "webview"))
+        except (OSError, shutil.Error):
+            pass   # 예전 창이 켜져 있어 잠긴 파일이 있으면 복사된 만큼만 쓴다(원본은 그대로)
 
 
 KEY_FILE = os.path.join(DATA_DIR, "key.bin")
@@ -249,6 +287,7 @@ def bind_server():
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
+    _migrate_legacy()   # 포트 파일을 읽기 전에(bind_server) 가져와야 예전 저장소 출처가 이어진다
     srv, shared = bind_server()
     port = srv.server_address[1]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
