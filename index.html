@@ -148,10 +148,10 @@ let PALETTES = [], STYLE_THUMBS = {}, PRICE_T = 0;   // 시작할 때 PixAI에�
 let STYLES = ['anime-watercolor-impasto','art-crayon','bold-line-soft-color','chibi','classic-japanese','clean-flat-illustration','colored-pencil-grain','cool-warm-oil-contrast','desaturated-cool','flat-anime-pastel','glossy-glass-anime','grey-blocks-lineless','hard-line-monochrome-accent','high-contrast-retro-vivid','holographic','korean-style','lineart-watercolor-airy','low-saturation-expressive-eyes','lucid-dreamy','luminous-retro-impasto','minimal-flat-color','modern-oil-glamour','moe-pastel','oil-watercolor-blend','painterly-doodle','paper-watercolor','pencil-sketch','poster-graffiti','retro-comic-fusion','retro-oil-glamour','retro-tv-anime','semi-realistic','stable-vaporwave','tinted-sketch','vintage-collage'];
 const SAMPLERS = ['Euler a','Euler','LMS','Heun','DPM2 Karras','DPM2 a Karras','DDIM','DPM++ 2M Karras','DPM++ 2S a Karras','DPM++ SDE Karras','DPM++ 2M SDE Karras','Restart'];
 const DEFAULT_LORAS = [
-  {alias:'haruka-style', id:'2051003597562149555', trigger:'harukav2 style', w:0.6, note:'PixAI 공식 · DiT.3'},
-  {alias:'solrasido', id:'2057086305644541766', trigger:'sharp lines, reflective animation style, detailed eyes', w:0.5, note:'DiT.3'},
-  {alias:'xipa', id:'2057321700192237743', trigger:'xipa style, detailed lineart, soft shading', w:0.5, note:'DiT.3'},
-  {alias:'soft-lineart', id:'2057677077565784673', trigger:'delicate anime watercolor style, fine lineart, soft pastel shading', w:0.5, note:'DiT.3'},
+  {alias:'haruka-style', id:'2051003597562149555', trigger:'harukav2 style', w:0.6, base:'MMDIT26B_MODEL', note:'PixAI 공식 · DiT.3'},
+  {alias:'solrasido', id:'2057086305644541766', trigger:'sharp lines, reflective animation style, detailed eyes', w:0.5, base:'MMDIT26B_MODEL', note:'DiT.3'},
+  {alias:'xipa', id:'2057321700192237743', trigger:'xipa style, detailed lineart, soft shading', w:0.5, base:'MMDIT26B_MODEL', note:'DiT.3'},
+  {alias:'soft-lineart', id:'2057677077565784673', trigger:'delicate anime watercolor style, fine lineart, soft pastel shading', w:0.5, base:'MMDIT26B_MODEL', note:'DiT.3'},
 ];
 const DEFAULT_SCENES = [
   ['기본','neutral expression, looking at viewer'],['미소','gentle smile, looking at viewer'],['웃음','laughing, open mouth, happy'],
@@ -209,6 +209,8 @@ function sanitize(s){ return String(s).replace(/[\\/:*?"<>|\s]+/g, '_').slice(0,
 /* ───────────── 상태 ───────────── */
 const S = Object.assign({key:'', conc:4, pollMs:2000, timeoutMin:30, relayOn:false, relayUrl:'http://127.0.0.1:8765', autosave:false}, lsGet('pxs.settings', {}));
 let LORAS = lsGet('pxs.loras', DEFAULT_LORAS);
+// LoRA는 붙는 모델 계열(base)이 정해져 있다. 옛 라이브러리는 note의 DiT.3으로 Tsubaki.3 계열을 추정하고, 모르면 비워 둔다(어디서나 보임)
+LORAS.forEach(l => { if (!l.base && /DiT\.3|내 학습/.test(l.note || '')) l.base = 'MMDIT26B_MODEL'; });
 const defParams = () => ({model:MODELS[0].id, custom:'', aspect:'1:1', size:'1k', batch:1, count:1, seed:'', helper:'disable', mode:'', style:'', styleCustom:'', sampler:'', steps:'', cfg:'', negative:'', loras:[], refs:[], i2i:null, i2iStr:0.55, profile:'', sizeW:1408, sizeH:1408, palette:null, priority:''});
 let SINGLE = Object.assign({prompt:'', params:defParams()}, lsGet('pxs.single', {}));
 SINGLE.params = Object.assign(defParams(), SINGLE.params || {});
@@ -408,6 +410,24 @@ const Q = {
     }
   },
 };
+// mediaId 선점: 확인과 선점 사이에 await가 없어서 두 경로가 같은 이미지를 동시에 저장하지 못한다
+const SAVING_MIDS = new Set();
+async function claimMid(mid){
+  if (!mid) return true;
+  while (SAVING_MIDS.has(mid)) await sleep(100);
+  if (IMAGES.some(r => r.mediaId === mid)) return false;
+  SAVING_MIDS.add(mid); return true;
+}
+function releaseMid(mid){ if (mid) SAVING_MIDS.delete(mid); }
+async function adoptImported(mid, j){
+  const r = mid && IMAGES.find(x => x.mediaId === mid);
+  if (!r || r.source !== 'import') return;
+  // DB에 먼저 쓰고 성공하면 화면 기록을 바꾼다(실패하면 예외 → 작업 실패 → 「결과 다시 받기」가 다시 시도)
+  const upd = {source:j.source, projectId:j.projectId || null, cellKey:j.cellKey || null, label:j.label || r.label, prompt:j.prompt, seed:j.seed,
+    params:j.p, loras:j.p.loras.filter(l => l.id), via:j.via, kind:j.kind || 'gen', tool:j.tool || null, taskId:j.taskId};
+  await DB.put('images', Object.assign({}, r, upd));
+  Object.assign(r, upd);
+}
 async function runJob(j){
   renderQueue();
   try {
@@ -447,6 +467,11 @@ async function runJob(j){
     for (let i = 0; i < urls.length; i++){
       const okey = mids[i] || String(i);
       if (j.savedKeys.includes(okey)) continue;
+      // 같은 이미지(mediaId)를 두 경로(큐·기록 가져오기)가 동시에 저장하지 않게 선점한다.
+      // 이미 가져오기로 들어와 있으면 새로 넣지 않고 그 기록에 이 작업의 연결 정보(프로젝트·씬 칸·설정)를 옮겨 붙인다.
+      const mid = mids[i] ? String(mids[i]) : null;
+      if (!(await claimMid(mid))){ await adoptImported(mid, j); j.savedKeys.push(okey); continue; }
+      try {
       const blob = await api.image(urls[i]);
       // 편집 도구 결과(확대 등)는 크기가 원본과 다르다 → 실제 픽셀로 기록
       let rw = t.width || j.w, rh = t.height || j.h;
@@ -457,6 +482,7 @@ async function runJob(j){
         cellKey:j.cellKey || null, label:j.label || '', fav:false, kind:j.kind || 'gen', tool:j.tool || null};
       await DB.put('images', rec); IMAGES.unshift(rec); j.savedKeys.push(okey);
       await autosave(rec);
+      } finally { releaseMid(mid); }
     }
     j.status = 'done';
     if (j.cancelReq) j.error = '취소가 안 먹어 완성됨 · 결과는 갤러리에 저장';
@@ -528,6 +554,9 @@ async function enqueueInner(jobs){
   if (!S.key && !MOCK){ alert('설정 탭에서 PixAI API 키를 먼저 넣어 주세요.'); go('settings'); return; }
   if (jobs.some(j => !j.prompt.trim())){ alert('프롬프트가 비어 있는 작업이 있습니다.'); return; }
   if (jobs.some(j => !modelId(j.p))){ alert('모델 버전 ID를 입력해 주세요.'); return; }
+  // 라이브러리가 아는 계열과 모델 계열이 다른 LoRA는 보내지 않는다(PixAI가 거부하거나 과금 뒤 실패)
+  const wrong = jobs.map(j => (!j.kind || j.kind === 'gen') && LORA_BASE[fam(j.p)] ? (j.p.loras || []).map(l => LORAS.find(x => x.id === l.id)).find(x => x && x.base && x.base !== LORA_BASE[fam(j.p)]) : null).find(Boolean);
+  if (wrong){ alert(`LoRA 「${wrong.alias}」는 이 모델 계열용이 아닙니다. 빼거나 모델을 바꿔 주세요.`); return; }
   if (!DESK && !MOCK && !S.relayOn && jobs.some(j => j.via === 'v1')){ alert('i2i는 PixAI가 브라우저 직접 호출을 막아 둔 경로라 창 앱(exe)이나 relay.py 릴레이에서만 됩니다.'); return; }
   const paid = jobs.filter(j => j.via !== 'relay');
   if (paid.length && !MOCK){
@@ -680,12 +709,13 @@ function paramsForm(p, onChange, opts = {}){
       const lib = LORAS.find(x => x.id === l.id);
       lb.append(h('div', {class:'lora-row'},
         h('select', {onchange:e => { const x = LORAS.find(y => y.id === e.target.value); l.id = e.target.value; if (x) l.w = x.w; ch(); draw(); }},
-          h('option', {value:''}, '선택'), LORAS.map(x => h('option', {value:x.id, selected:x.id === l.id}, x.alias))),
+          h('option', {value:''}, '선택'), LORAS.filter(x => !x.base || x.base === LORA_BASE[f] || x.id === l.id).map(x => h('option', {value:x.id, selected:x.id === l.id}, x.alias + (x.base && x.base !== LORA_BASE[f] ? ' (다른 모델용)' : '')))),
         h('input', {type:'number', step:'0.05', min:0, max:1, value:l.w, oninput:e => { l.w = e.target.value; ch(); }}),
         h('button', {class:'sm', title:'빼기', onclick:() => { p.loras.splice(i, 1); ch(); draw(); }}, '×')));
       if (lib && lib.trigger && opts.onTrigger) lb.append(h('div', {class:'faint'}, '트리거: ' + lib.trigger + ' ', h('button', {class:'sm', onclick:() => opts.onTrigger(lib.trigger)}, '프롬프트에 넣기')));
     });
     if (p.loras.length < 5) lb.append(h('button', {class:'sm', onclick:() => { p.loras.push({id:'', w:0.6}); ch(); draw(); }}, '+ LoRA'));
+    if (DESK && LORA_BASE[f]) lb.append(' ', h('button', {class:'sm', title:'PixAI 마켓에서 이 모델용 LoRA 검색', onclick:() => loraSearch(p, () => { ch(); draw(); })}, 'LoRA 찾기'));
     box.append(lb);
     // 레퍼런스
     const rb = h('div', {}, h('label', {class:'f'}, '레퍼런스 이미지 (최대 3 · 프롬프트에서 @image1로 지칭 · 유료)'));
@@ -1019,10 +1049,10 @@ function viewPack(){
 /* 갤러리 */
 let GF = 'all';
 function viewGallery(){
-  const list = IMAGES.filter(r => GF === 'all' ? true : GF === 'fav' ? r.fav : GF === 'single' ? r.source === 'single' : r.projectId === GF);
+  const list = IMAGES.filter(r => GF === 'all' ? true : GF === 'fav' ? r.fav : GF === 'single' ? r.source === 'single' : GF === 'import' ? r.source === 'import' : r.projectId === GF);
   const bar = h('div', {class:'card row', style:'margin-bottom:12px'},
     h('select', {class:'nf', style:'width:220px', onchange:e => { GF = e.target.value; GSEL.clear(); render(); }},
-      [['all', `전체 (${IMAGES.length})`], ['fav', '즐겨찾기'], ['single', '단일 생성'], ...PROJECTS.map(p => [p.id, '팩: ' + p.name])].map(([v, t]) => h('option', {value:v, selected:v === GF}, t))),
+      [['all', `전체 (${IMAGES.length})`], ['fav', '즐겨찾기'], ['single', '단일 생성'], ['import', 'PixAI 기록'], ...PROJECTS.map(p => [p.id, '팩: ' + p.name])].map(([v, t]) => h('option', {value:v, selected:v === GF}, t))),
     h('button', {class:'nf', onclick:() => { const all = list.every(r => GSEL.has(r.id)); list.forEach(r => all ? GSEL.delete(r.id) : GSEL.add(r.id)); render(); }}, '전체 선택/해제'),
     h('span', {class:'muted nf'}, `선택 ${GSEL.size}`),
     h('button', {class:'nf', disabled:!GSEL.size || null, onclick:async e => { const b = e.currentTarget; b.disabled = true; b.textContent = '압축 중…'; const recs = IMAGES.filter(r => GSEL.has(r.id)); const z = await zipBlobs(recs.map(r => ({name:fileName(r), blob:r.blob}))); download(z, 'pxstudio_' + Date.now() + '.zip'); render(); }}, 'ZIP 다운로드'),
@@ -1036,6 +1066,7 @@ function viewGallery(){
       for (const r of recs) if (!TRAIN.items.some(x => x.mediaId === r.mediaId)){ TRAIN.items.push({mediaId:r.mediaId}); k++; }
       saveTrain(); alert(`학습 세트에 ${k}장을 넣었습니다 (지금 ${TRAIN.items.length}장).` + (recs.length < GSEL.size ? ' 영상과 mediaId가 없는 이미지는 뺐습니다.' : ''));
     }}, '학습 세트에 추가') : null,
+    DESK ? h('button', {class:'nf', title:'PixAI 계정의 생성 기록에서 이미지·영상을 골라 이 갤러리로 가져옵니다', onclick:importFromPixai}, 'PixAI 기록에서 가져오기') : null,
     h('span', {class:'sp'}),
     h('span', {class:'faint nf'}, '이미지는 이 브라우저 저장소(IndexedDB)에 보관됩니다. PixAI 원본 URL은 시간이 지나면 만료됩니다.'));
   const grid = h('div', {class:'grid'}, list.map(r => thumbEl(r, () => openLB(r, list),
@@ -1069,7 +1100,7 @@ async function pollTrainTasks(){
 setInterval(async () => { if (DESK && S.key && TRAIN.tasks.some(t => !['completed', 'failed', 'cancelled'].includes(t.status))){ await pollTrainTasks(); const a = document.activeElement; if (TAB === 'train' && !(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) render(); } }, 60000);
 function addToLibrary(title, versionId, trigger){
   if (LORAS.some(l => l.id === versionId)) return;
-  LORAS.push({alias:title, id:versionId, trigger:trigger || '', w:0.7, note:'내 학습 · DiT.3'}); saveAll();
+  LORAS.push({alias:title, id:versionId, trigger:trigger || '', w:0.7, note:'내 학습 · DiT.3', base:'MMDIT26B_MODEL'}); saveAll();
 }
 function viewTrain(){
   if (!DESK) return h('div', {class:'card note'}, 'LoRA 학습은 PixAI가 브라우저 직접 호출을 막아 둔 경로라 창 앱(PXStudio.exe)에서만 됩니다.');
@@ -1333,6 +1364,169 @@ async function chatEditModal(rec){
     }}, '편집하기')));
   upd();
 }
+/* LoRA 찾기 (PixAI 마켓 · GraphQL generationModels{keyword, loraBaseModelTypes} · 2026-09-27 실측)
+   모델 계열마다 붙는 LoRA 기반 타입이 다르다: Tsubaki.3 MMDIT26B · Tsubaki.2 MMDIT26A · SDXL. 트리거는 버전 extra.triggerWords. */
+const LORA_BASE = {tsubaki3:'MMDIT26B_MODEL', tsubaki2:'MMDIT26A_MODEL', sdxl:'SDXL_MODEL'};
+const thumbOf = m => { const u = (m && m.media && m.media.urls) || []; const t = u.find(x => x.variant === 'THUMBNAIL') || u[0]; return t && t.url; };
+function loraSearch(p, onChange){
+  const {card} = modalShell('LoRA 찾기 (PixAI 마켓)', 1040);
+  const base = p ? LORA_BASE[fam(p)] : 'MMDIT26B_MODEL';
+  if (!base){ card.append(h('div', {class:'faint'}, '이 모델은 LoRA 계열을 몰라서 찾을 수 없습니다. 버전 ID를 직접 넣어 주세요.')); return; }
+  const st = {kw:'', after:null, items:[], sort:'ref', blur:true, busy:false, total:0, err:''};
+  const kw = h('input', {type:'text', placeholder:'검색어 (예: watercolor, xipa, 캐릭터 이름) · 비우면 전체', onkeydown:e => { if (e.key === 'Enter') run(true); }});
+  const info = h('span', {class:'faint'}), grid = h('div', {class:'grid', style:'grid-template-columns:repeat(auto-fill,minmax(220px,1fr))'}), more = h('button', {class:'nf', onclick:() => run(false)}, '더 보기');
+  const draw = () => {
+    const list = [...st.items].sort((a, b) => st.sort === 'ref' ? (b.refCount || 0) - (a.refCount || 0) : st.sort === 'like' ? (b.likedCount || 0) - (a.likedCount || 0) : 0);
+    grid.replaceChildren(...list.map(m => {
+      const v = m.latestAvailableVersion || {}, trig = (v.extra && v.extra.triggerWords) || '', th = thumbOf(v) || thumbOf(m);
+      const inLib = LORAS.some(l => l.id === v.id), inForm = p && p.loras.some(l => l.id === v.id);
+      return h('div', {class:'card stack', style:'padding:8px'},
+        th ? h('img', {src:th, loading:'lazy', style:`width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;${m.isNsfw && st.blur ? 'filter:blur(14px)' : ''}`}) : h('div', {class:'faint', style:'aspect-ratio:1'}, '썸네일 없음'),
+        h('b', {style:'font-size:13px'}, m.title), h('div', {class:'faint'}, `${m.category || ''} · 사용 ${(m.refCount || 0).toLocaleString()} · ♥ ${(m.likedCount || 0).toLocaleString()}${m.isNsfw ? ' · 성인' : ''}`),
+        h('div', {class:'pv', title:trig}, trig ? '트리거: ' + trig : '트리거 없음'),
+        h('div', {class:'row', style:'gap:4px'},
+          p ? h('button', {class:'sm', disabled:!v.id || inForm || p.loras.length >= 5 || null, onclick:() => { if (!inLib) LORAS.push({alias:m.title, id:v.id, trigger:trig, w:0.6, note:'마켓', base}); p.loras.push({id:v.id, w:0.6}); saveAll(); onChange && onChange(); draw(); }}, inForm ? '넣음' : '이 설정에 넣기') : null,
+          h('button', {class:'sm', disabled:!v.id || inLib || null, onclick:() => { LORAS.push({alias:m.title, id:v.id, trigger:trig, w:0.6, note:'마켓', base}); saveAll(); draw(); }}, inLib ? '라이브러리에 있음' : '라이브러리에 추가')));
+    }));
+    info.textContent = st.err ? '검색 실패: ' + st.err : `${st.total.toLocaleString()}개 중 ${st.items.length}개` + (st.busy ? ' · 불러오는 중…' : '');
+    more.disabled = !st.after || st.busy || null;
+  };
+  let seq = 0;
+  const run = async reset => {
+    // 새 검색은 진행 중인 조회를 대신한다(창을 열자마자 검색해도 버려지지 않게). 「더 보기」만 진행 중이면 기다린다
+    if (st.busy && !reset) return;
+    const my = ++seq;
+    if (reset){ st.kw = kw.value.trim(); st.after = null; st.items = []; st.total = 0; }
+    st.err = '';
+    st.busy = true; draw();
+    try {
+      const d = await gql('query($k: String, $b: [GenerationModelType!], $a: String){ generationModels(first: 24, keyword: $k, loraBaseModelTypes: $b, after: $a){ totalCount pageInfo { hasNextPage endCursor } edges { node { id title category isNsfw likedCount refCount media { urls { variant url } } latestAvailableVersion { id name extra media { urls { variant url } } } } } } }',
+        {k:st.kw || null, b:[base], a:st.after});
+      if (my !== seq) return;   // 더 나중 검색이 있으면 이 응답은 버린다
+      const g = d.generationModels; st.total = g.totalCount; st.items.push(...g.edges.map(e => e.node)); st.after = g.pageInfo.hasNextPage ? g.pageInfo.endCursor : null;
+    } catch (e){ if (my !== seq) return; st.err = e.message; }
+    st.busy = false; draw();
+  };
+  card.append(h('div', {class:'row'}, kw, h('button', {class:'pri nf', onclick:() => run(true)}, '검색'),
+      h('select', {class:'nf', style:'width:120px', onchange:e => { st.sort = e.target.value; draw(); }}, [['ref', '사용 많은 순'], ['like', '좋아요 순'], ['api', '받은 순서']].map(([a, b]) => h('option', {value:a}, b))),
+      h('label', {class:'nf'}, h('input', {type:'checkbox', checked:true, onchange:e => { st.blur = e.target.checked; draw(); }}), ' 성인 썸네일 흐리게')),
+    h('div', {class:'faint'}, `${p ? modelOf(p).name : 'Tsubaki.3'}용(${base})만 찾습니다. 정렬은 불러온 목록 안에서만 합니다.`), info, grid, more);
+  kw.focus(); run(true);
+}
+
+let IMPORT_BUSY = false;
+// 가져온 작업의 파라미터(v1 형식)를 앱 설정으로 되살린다 — 「같은 시드로 다시」가 원래 설정으로 나가게
+function paramsFromTask(par){
+  const p = defParams();
+  if (MODELS.some(x => x.id === par.modelId)) p.model = par.modelId; else if (par.modelId){ p.model = 'custom'; p.custom = String(par.modelId); }
+  const w = +par.width, hh = +par.height;
+  if (w && hh){
+    if (fam(p) === 'tsubaki3'){ p.size = 'custom'; p.sizeW = w; p.sizeH = hh; }
+    else { let best = '1:1', bd = 9; for (const k of Object.keys(RES)){ const [a, b] = k.split(':').map(Number); const d = Math.abs(a / b - w / hh); if (d < bd){ bd = d; best = k; } } p.aspect = best; p.size = Math.max(w, hh) > 1300 ? '1.5k' : '1k'; }
+  }
+  if (+par.batchSize === 4) p.batch = 4;
+  if (par.negativePrompts) p.negative = String(par.negativePrompts);
+  if (par.lora && typeof par.lora === 'object') p.loras = Object.entries(par.lora).slice(0, 5).map(([id, wt]) => ({id:String(id), w:+wt}));
+  if (par.inferenceProfile === 'ultra') p.profile = 'ultra';
+  if (par.priority != null) p.priority = String(par.priority);
+  if (par.modelStyle && par.modelStyle.type === 'key') p.style = par.modelStyle.keyId; else if (par.modelStyle && par.modelStyle.type === 'custom'){ p.style = '__custom'; p.styleCustom = par.modelStyle.custom || ''; }
+  if (par.colorPalette) p.palette = par.colorPalette;
+  if (par.mediaId && par.strength != null && !par.enlarge){ p.i2i = {mediaId:String(par.mediaId)}; p.i2iStr = +par.strength; }
+  if (Array.isArray(par.contextImages)) p.refs = par.contextImages.slice(0, 3).map(m => ({mediaId:String(m)}));
+  if (fam(p) === 'sdxl'){ if (par.samplingMethod) p.sampler = String(par.samplingMethod); if (par.samplingSteps != null && par.samplingSteps !== '') p.steps = String(par.samplingSteps); if (par.cfgScale != null && par.cfgScale !== '') p.cfg = String(par.cfgScale); }
+  if (Array.isArray(par.controlNets)) p.cn = par.controlNets.map(c => ({type:c.type, mediaId:String(c.mediaId), weight:c.weight ?? 1}));
+  return p;
+}
+// 편집 작업이면 종류와 다시 보낼 본문을 되살린다(v1 본문이 그대로 남는 것만 · 인페인트·보정은 v2 본문이라 「다시」 없음)
+function kindFromTask(par){
+  if (par.i2vPro) return ['i2v', {i2vPro:par.i2vPro}];
+  if (par.enlarge) return ['enlarge', {mediaId:String(par.mediaId), enlarge:par.enlarge, enlargeModel:par.enlargeModel}];
+  if (par.chat) return ['chat', {chat:par.chat}];
+  if (par.inpaint || par.fixer) return ['inpaint', null];
+  return ['gen', null];
+}
+/* PixAI 기록에서 가져오기: 웹에서 만든 작업(me.tasks)은 목록으로, API 작업은 목록에 안 나와서 크레딧 기록의 작업 ID로 찾는다(무료 레인 작업은 기록이 없어 못 찾음) */
+async function importFromPixai(){
+  const {card} = modalShell('PixAI 기록에서 가져오기', 1040);
+  const info = h('div', {class:'faint'}, '작업 목록을 모으는 중…'), grid = h('div', {class:'grid'}), bar = h('div', {class:'row'});
+  card.append(info, bar, grid);
+  let ids = [];
+  try {
+    const errs = [];
+    const [a, b] = await Promise.all([
+      gql('{ me { tasks(last: 50) { edges { node { id } } } } }').catch(e => { errs.push('웹 작업 목록: ' + e.message); return null; }),
+      gql('{ me { quotaLogs(last: 300) { edges { node { type extra } } } } }').catch(e => { errs.push('크레딧 기록: ' + e.message); return null; })]);
+    if (!a && !b){ info.textContent = '목록을 못 읽었습니다 — ' + errs.join(' / '); return; }
+    if (errs.length) info.dataset.warn = '일부 목록을 못 읽음 — ' + errs.join(' / ');
+    const s = new Set();
+    if (a) a.me.tasks.edges.forEach(e => s.add(String(e.node.id)));
+    if (b) b.me.quotaLogs.edges.forEach(e => { const x = e.node.extra; if (e.node.type === 'task_cost' && x && x.taskId) s.add(String(x.taskId)); });
+    ids = [...s].sort((x, y) => (BigInt(y) > BigInt(x) ? 1 : -1));   // 작업 ID는 시간순으로 커진다 → 최신순
+  } catch (e){ info.textContent = '목록 실패: ' + e.message; return; }
+  const have = new Set(IMAGES.map(r => r.mediaId).filter(Boolean));
+  const tasks = [], sel = new Set();
+  let shown = 0;
+  const TQ = 'query($id: ID!){ task(id: $id){ id status createdAt paidCredit mediaId outputs parameters media { urls { variant url } } } }';
+  // 영상: GraphQL task는 outputs.videos[].mediaId, v2 REST는 outputs.videoMediaId (2026-09-27 실측 · 둘 다 읽는다)
+  const outIds = t => { const o = t.outputs || {}; if ((t.parameters && t.parameters.i2vPro) || o.videos || o.videoMediaId) return (o.videos && o.videos.length ? o.videos.map(v => v.mediaId) : [o.videoMediaId]).filter(Boolean).map(String); return (o.batch && o.batch.length ? o.batch.map(x => x.mediaId) : [o.mediaId || t.mediaId]).filter(Boolean).map(String); };
+  const isVidTask = t => !!((t.parameters && t.parameters.i2vPro) || (t.outputs && (t.outputs.videos || t.outputs.videoMediaId)));
+  const drawGrid = () => {
+    grid.replaceChildren(...tasks.map(t => {
+      const par = t.parameters || {}, mids = outIds(t), done = mids.length && mids.every(m => have.has(m)), vid = isVidTask(t);
+      const pr = par.prompts || (par.i2vPro && par.i2vPro.prompts) || (par.inpaint ? '인페인트' : '') || (par.enlarge ? '확대' : '') || '';
+      return h('div', {class:'thumb', style:'aspect-ratio:auto', onclick:() => { if (done) return; sel.has(t.id) ? sel.delete(t.id) : sel.add(t.id); drawGrid(); }},
+        vid ? h('div', {style:'aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#111'}, '▶ 영상') : h('img', {src:thumbOf(t) || '', loading:'lazy', style:'aspect-ratio:1'}),
+        h('input', {type:'checkbox', class:'sel', checked:sel.has(t.id), disabled:done || null, onclick:e => e.stopPropagation(), onchange:e => { e.target.checked ? sel.add(t.id) : sel.delete(t.id); drawGrid(); }}),
+        h('div', {class:'cap'}, `${new Date(t.createdAt).toLocaleDateString()} · ${mids.length}장${t.paidCredit ? ' · ' + t.paidCredit.toLocaleString() : ''}${done ? ' · 가져옴' : ''} · ${pr.slice(0, 30)}`));
+    }));
+    bar.replaceChildren(h('span', {class:'muted nf'}, `작업 ${ids.length}개 중 ${tasks.length}개 표시 · 선택 ${sel.size}`),
+      h('button', {class:'sm nf', onclick:() => { tasks.forEach(t => { const m = outIds(t); if (m.length && !m.every(x => have.has(x))) sel.add(t.id); }); drawGrid(); }}, '가져올 것 모두 선택'),
+      h('span', {class:'sp'}),
+      h('button', {class:'sm nf', disabled:shown >= ids.length || null, onclick:loadMore}, '더 보기'),
+      h('button', {class:'pri nf', disabled:!sel.size || IMPORT_BUSY || null, onclick:doImport}, IMPORT_BUSY ? '가져오는 중…' : `선택 ${sel.size}개 가져오기`));
+  };
+  const loadMore = async () => {
+    const batch = ids.slice(shown, shown + 24); shown += batch.length; info.textContent = '작업 정보를 읽는 중…';
+    for (let i = 0; i < batch.length; i += 4){
+      const got = await Promise.all(batch.slice(i, i + 4).map(id => gql(TQ, {id}).then(d => d.task).catch(() => null)));
+      got.forEach(t => { if (t && t.status === 'completed' && outIds(t).length) tasks.push(t); });
+      drawGrid();
+    }
+    info.textContent = '웹에서 만든 작업과, 크레딧이 빠진 API 작업이 보입니다. 무제한 레인(무료) 작업은 기록이 없어 여기 안 나옵니다.' + (info.dataset.warn ? ' · ' + info.dataset.warn : '');
+  };
+  const doImport = async e => {
+    if (IMPORT_BUSY) return;
+    IMPORT_BUSY = true; const btn = e.currentTarget; btn.disabled = true; let n = 0, fail = 0;
+    try {
+    for (const t of tasks.filter(x => sel.has(x.id))){
+      const par = t.parameters || {}, vid = isVidTask(t);
+      for (const mid of outIds(t)){
+        if (have.has(mid) || !(await claimMid(mid))){ have.add(mid); continue; }
+        btn.textContent = `가져오는 중 ${n + 1}…`;
+        try {
+          const m = (await gql('query($id: String!){ media(id: $id){ type width height fileUrl urls { variant url } } }', {id:mid})).media;
+          const url = vid ? m.fileUrl : ((m.urls || []).find(u => u.variant === 'PUBLIC') || {}).url;
+          if (!url) throw new Error('주소 없음');
+          const blob = await api.image(url);
+          const p = paramsFromTask(par), [kind, tool] = kindFromTask(par);
+          const rec = {id:uid(), createdAt:Date.parse(t.createdAt) || Date.now(), blob, mediaId:mid, taskId:t.id, prompt:par.prompts || (par.i2vPro && par.i2vPro.prompts) || (par.chat && par.chat.prompts) || '', negative:par.negativePrompts || '',
+            seed:+par.seed || (t.outputs && t.outputs.seed) || 0, model:par.modelId || '', modelName:(MODELS.find(x => x.id === par.modelId) || {}).name || 'PixAI', w:m.width || par.width, h:m.height || par.height,
+            aspect:p.aspect, size:p.size, loras:p.loras, params:p, via:'import', paid:t.paidCredit || null, source:'import', projectId:null, cellKey:null, label:'PixAI 기록', fav:false, kind, tool};
+          await DB.put('images', rec); IMAGES.push(rec); have.add(mid); n++;
+        } catch (err){ fail++; console.warn('가져오기 실패', mid, err); }
+        finally { releaseMid(mid); }
+      }
+      sel.delete(t.id);
+    }
+    } finally { IMPORT_BUSY = false; }
+    IMAGES.sort((a, b) => b.createdAt - a.createdAt);
+    info.textContent = `${n}장 가져옴` + (fail ? ` · 실패 ${fail}` : '') + ' · 갤러리의 「PixAI 기록」에서 볼 수 있습니다.';
+    drawGrid(); if (TAB === 'gallery') render();
+  };
+  info.textContent = '작업 정보를 읽는 중…';
+  await loadMore();
+}
+
 async function suggestModal(rec){
   const {card} = modalShell('이미지에서 프롬프트 추출 (무료)', 760);
   const box = h('div', {class:'stack'}, h('div', {class:'faint'}, 'PixAI에 묻는 중…')); card.append(box);
@@ -1411,7 +1605,8 @@ function viewSettings(){
         h('button', {class:'nf', onclick:async () => { rres.textContent = '확인 중…'; rres.textContent = await api.checkRelay(); }}, '연결 확인'), rres)),
     h('div', {class:'card stack'}, h('h3', {}, 'LoRA 라이브러리'), lib,
       h('div', {class:'row'}, h('button', {class:'nf', onclick:() => { LORAS.push({alias:'새 LoRA', id:'', trigger:'', w:0.6}); saveAll(); render(); }}, '+ 추가'),
-        DESK ? h('button', {class:'nf', onclick:() => go('train')}, '내 학습 LoRA 불러오기') : null, h('span', {class:'faint'}, '버전 ID = LoRA 모델 페이지에서 버전을 누른 뒤 URL 마지막 숫자. Tsubaki.3에는 DiT.3용만 붙습니다.'))),
+        DESK ? h('button', {class:'nf', onclick:() => go('train')}, '내 학습 LoRA 불러오기') : null,
+        DESK ? h('button', {class:'nf', onclick:() => loraSearch(null)}, 'PixAI 마켓에서 찾기') : null, h('span', {class:'faint'}, '버전 ID = LoRA 모델 페이지에서 버전을 누른 뒤 URL 마지막 숫자. Tsubaki.3에는 DiT.3용만 붙습니다.'))),
     h('div', {class:'card stack'}, h('h3', {}, '백업'),
       h('div', {class:'row'},
         h('button', {class:'nf', onclick:() => download(new Blob([JSON.stringify({v:1, settings:Object.assign({}, S, {key:''}), loras:LORAS, projects:PROJECTS, single:SINGLE, scenesets:SCENESETS, charsets:CHARSETS}, null, 1)], {type:'application/json'}), 'pxstudio_backup.json')}, '설정·프로젝트 내보내기 (키 제외)'),
