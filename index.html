@@ -136,13 +136,22 @@ table.lib input{padding:3px 6px}
 const DESK = new URLSearchParams(location.search).get('app') || '';
 const API = DESK ? location.origin + '/api' : 'https://api.pixai.art';
 const MOCK = new URLSearchParams(location.search).has('mock');
-const MODELS = [
-  {id:'2024383379556065549', name:'Tsubaki.3', fam:'tsubaki3', unit:4000},
-  {id:'1983308862240288769', name:'Tsubaki.2', fam:'tsubaki2', unit:2600},
-  {id:'1861558740588989558', name:'Haruka v2 (SDXL)', fam:'sdxl', unit:null},
-  {id:'1954632828118619567', name:'Hoshino v2 (SDXL)', fam:'sdxl', unit:null},
-  {id:'custom', name:'직접 입력 (버전 ID)', fam:'custom', unit:null},
+// 모델 종류(PixAI generationModel.type) → 앱 안 계열 이름. LoRA 계열(loraBaseModelTypes)은 모델 종류 값과 같다(2026-09-27 조회)
+const TYPE_FAM = {MMDIT26B_MODEL:'tsubaki3', MMDIT26A_MODEL:'tsubaki2', SDXL_MODEL:'sdxl', SD_V1_MODEL:'sd1', DIT7_MODEL:'tsubaki1', DIT7B_MODEL:'tsubaki1',
+  DIT9_MODEL:'dit9', USER_DIT26A_MODEL:'anima', USER_DIT26B_MODEL:'zimage', Z_IMAGE_V1_MODEL:'zimage', SD3_MEDIUM_MODEL:'sd3'};
+const T3_ID = '2024383379556065549', T2_ID = '1983308862240288769';
+const BUILTIN_MODELS = [
+  {id:T3_ID, name:'Tsubaki.3', type:'MMDIT26B_MODEL', unit:4000},
+  {id:'2050048243034896798', name:'Tsubaki.3 Flash', type:'MMDIT26B_MODEL', unit:null},
+  {id:T2_ID, name:'Tsubaki.2', type:'MMDIT26A_MODEL', unit:2600},
+  {id:'1861558740588989558', name:'Haruka v2 (SDXL)', type:'SDXL_MODEL', unit:null},
+  {id:'1954632828118619567', name:'Hoshino v2 (SDXL)', type:'SDXL_MODEL', unit:null},
 ];
+const CUSTOM_MODEL = {id:'custom', name:'직접 입력 (버전 ID)', type:null, unit:null};
+let MYMODELS = (() => { try { const v = JSON.parse(localStorage.getItem('pxs.models') || '[]'); return Array.isArray(v) ? v : []; } catch { return []; } })();   // 「모델 찾기」로 추가 [{id(버전), name, type}]
+const MODELS = [];   // 같은 배열을 계속 쓴다(여러 곳이 참조) — 내용만 갈아 끼운다
+function rebuildModels(){ MODELS.splice(0, MODELS.length, ...BUILTIN_MODELS, ...MYMODELS.filter(m => !BUILTIN_MODELS.some(b => b.id === m.id)), CUSTOM_MODEL); }
+rebuildModels();
 const RES = {'1:1':[[1024,1024],[1536,1536]],'2:3':[[848,1280],[1024,1536]],'3:2':[[1280,848],[1536,1024]],'3:4':[[864,1152],[1152,1536]],'4:3':[[1152,864],[1536,1152]],'3:5':[[768,1280],[912,1536]],'5:3':[[1280,768],[1536,912]],'9:16':[[720,1280],[864,1536]],'16:9':[[1280,720],[1536,864]],'1:3':[[512,1536],[512,1536]],'3:1':[[1536,512],[1536,512]]};
 let PALETTES = [], STYLE_THUMBS = {}, PRICE_T = 0;   // 시작할 때 PixAI에서 읽는다(공식 팔레트 프리셋·스타일 키 썸네일)
 let STYLES = ['anime-watercolor-impasto','art-crayon','bold-line-soft-color','chibi','classic-japanese','clean-flat-illustration','colored-pencil-grain','cool-warm-oil-contrast','desaturated-cool','flat-anime-pastel','glossy-glass-anime','grey-blocks-lineless','hard-line-monochrome-accent','high-contrast-retro-vivid','holographic','korean-style','lineart-watercolor-airy','low-saturation-expressive-eyes','lucid-dreamy','luminous-retro-impasto','minimal-flat-color','modern-oil-glamour','moe-pastel','oil-watercolor-blend','painterly-doodle','paper-watercolor','pencil-sketch','poster-graffiti','retro-comic-fusion','retro-oil-glamour','retro-tv-anime','semi-realistic','stable-vaporwave','tinted-sketch','vintage-collage'];
@@ -189,18 +198,67 @@ function joinParts(parts){
   for (const p of parts.map(s => (s || '').trim()).filter(Boolean)) out = out ? out + (/[.!?]$/.test(out) ? ' ' : ', ') + p : p;
   return out;
 }
-function modelOf(p){ return MODELS.find(m => m.id === p.model) || MODELS[0]; }
+function modelOf(p){ return MODELS.find(m => m.id === p.model) || {id:p.model, name:'모델 ' + p.model, type:null, unit:null}; }
 function modelId(p){ return p.model === 'custom' ? String(p.custom || '').trim() : p.model; }
-function fam(p){ return modelOf(p).fam; }
+function modelType(p){ const m = modelOf(p); return m.type || (INFO[modelId(p)] && INFO[modelId(p)].type) || null; }
+function fam(p){ const t = modelType(p); return t ? (TYPE_FAM[t] || 'other') : 'custom'; }
+// 모델별 기능은 PixAI에서 읽는다(/v2/generation-model/{ver}/features·inference-profiles·size-config·style-keys). 못 읽었을 때만 계열 기본값
+const INFO = (() => { try { return JSON.parse(localStorage.getItem('pxs.modelinfo') || '{}') || {}; } catch { return {}; } })();
+const FALLBACK_FEATS = {
+  tsubaki3:['lora', 'negativePrompt', 'styleKey', 'inferenceProfile', 'contextImages', 'colorPalette'],
+  tsubaki2:['lora', 'negativePrompt', 'styleKey', 'inferenceProfile'],
+  sdxl:['lora', 'controlnet', 'upscale', 'enableADetailer', 'clipSkip', 'negativePrompt', 'cfgScale'],
+  other:['lora', 'negativePrompt', 'cfgScale']};
+// SDXL·SD1은 기능 목록에 없어도 샘플러·스텝을 받는다(2026-09-27 Haruka v2 실측: 파라미터 유지·완료)
+const EXTRA_FEATS = {sdxl:['samplingMethod', 'samplingSteps'], sd1:['samplingMethod', 'samplingSteps']};
+// 품질 프로필. 옛 판의 Tsubaki.2 「모드」(p.mode)가 남아 있으면 그것이 T2 값이다(새 판은 프로필을 고르면 mode를 비운다).
+// 모델이 알려 준 프로필 목록에 없는 값(다른 모델에서 고른 것)은 보내지 않는다
+function profOf(p){
+  const v = (fam(p) === 'tsubaki2' && p.mode) ? p.mode : (p.profile || '');
+  const i = INFO[modelId(p)];
+  return v && i && i.profiles && i.profiles.length && !i.profiles.some(x => x.name === v) ? '' : v;
+}
+function feat(p, name){
+  if ((EXTRA_FEATS[fam(p)] || []).includes(name)) return true;
+  const i = INFO[modelId(p)]; if (i && Array.isArray(i.features)) return i.features.includes(name);
+  return (FALLBACK_FEATS[fam(p)] || FALLBACK_FEATS.other).includes(name);
+}
+function maxSide(p){ const i = INFO[modelId(p)]; const r = i && i.sizes && i.sizes.length ? Math.max(...i.sizes.map(x => Math.max(x.maxWidth || 0, x.maxHeight || 0))) : 0; return r || (fam(p) === 'tsubaki3' ? 2496 : 0); }
+const INFO_LOADING = new Map();   // 버전 → 진행 중인 조회(보내기 직전에 기다릴 수 있게)
+function loadModelInfo(ver, known){
+  if (!ver || MOCK || !S.key) return Promise.resolve();
+  const cur = INFO[ver]; if (cur && Date.now() - (cur.at || 0) < 86400000) return Promise.resolve();
+  if (!INFO_LOADING.has(ver)) INFO_LOADING.set(ver, fetchModelInfo(ver, known).finally(() => INFO_LOADING.delete(ver)));
+  return INFO_LOADING.get(ver);
+}
+async function fetchModelInfo(ver, known){
+  try {
+    const get = path => http(API + '/v2/generation-model/' + encodeURIComponent(ver) + path, {headers:auth()}).catch(e => (e.status === 404 ? null : Promise.reject(e)));
+    const [f, pr, sz, sk] = await Promise.all([get('/features'), get('/inference-profiles'), get('/size-config'), get('/style-keys')]);
+    let type = known || (f && f.modelType) || null;
+    if (!type && DESK) try { const v = (await gql('query($id: ID!){ generationModelVersion(id: $id){ modelId } }', {id:ver})).generationModelVersion; if (v) type = (await gql('query($id: ID!){ generationModel(id: $id){ type } }', {id:v.modelId})).generationModel.type; } catch {}
+    INFO[ver] = {at:Date.now(), type,
+      features:f && Array.isArray(f.features) ? f.features.filter(x => x.status === 'on').map(x => x.featureName) : null,
+      profiles:pr && Array.isArray(pr.profiles) ? pr.profiles.map(x => ({name:x.profileName, title:x.title || x.profileName})) : [],
+      sizes:sz && Array.isArray(sz.ranges) ? sz.ranges.map(r => ({name:r.name, maxWidth:r.maxWidth, maxHeight:r.maxHeight})) : [],
+      styleKeys:Array.isArray(sk) ? sk.map(k => ({id:k.id, thumb:k.artworks && k.artworks[0] && k.artworks[0].thumbnailUrl})) : []};
+    try { localStorage.setItem('pxs.modelinfo', JSON.stringify(INFO)); } catch {}
+    if (TAB === 'gen' || TAB === 'pack') render();
+  } catch (e){ console.warn('모델 정보 실패', ver, e); }
+}
 const snap16 = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round((+v || lo) / 16) * 16));
 function dims(p, v1){
-  // 직접 입력 크기: Tsubaki.3 size-config 범위 512~2496, 16 단위 (2026-09 조회)
-  if (p.size === 'custom' && fam(p) === 'tsubaki3' && !v1) return [snap16(p.sizeW, 512, 2496), snap16(p.sizeH, 512, 2496)];
+  // 직접 입력 크기: 모델 size-config의 최대 변까지(Tsubaki.3 2496 · SDXL·SD1 1400 등), 16 단위
+  const mx = maxSide(p);
+  if (p.size === 'custom' && mx && !v1) return [snap16(p.sizeW, 512, mx), snap16(p.sizeH, 512, mx)];
   let [w, hh] = RES[p.aspect][p.size === '1.5k' ? 1 : 0];
   if (v1){ // v1 한 변 512~1280
     [w, hh] = RES[p.aspect][0];
     const k = Math.min(1, 1280 / Math.max(w, hh));
     w = Math.max(512, Math.round(w * k / 16) * 16); hh = Math.max(512, Math.round(hh * k / 16) * 16);
+  } else if (mx && Math.max(w, hh) > mx){ // 1.5k 프리셋이 모델 최대 변(SDXL 1400 등)을 넘으면 비율을 지켜 줄인다
+    const k = mx / Math.max(w, hh);
+    w = Math.max(512, Math.floor(w * k / 16) * 16); hh = Math.max(512, Math.floor(hh * k / 16) * 16);
   }
   return [w, hh];
 }
@@ -211,7 +269,7 @@ const S = Object.assign({key:'', conc:4, pollMs:2000, timeoutMin:30, relayOn:fal
 let LORAS = lsGet('pxs.loras', DEFAULT_LORAS);
 // LoRA는 붙는 모델 계열(base)이 정해져 있다. 옛 라이브러리는 note의 DiT.3으로 Tsubaki.3 계열을 추정하고, 모르면 비워 둔다(어디서나 보임)
 LORAS.forEach(l => { if (!l.base && /DiT\.3|내 학습/.test(l.note || '')) l.base = 'MMDIT26B_MODEL'; });
-const defParams = () => ({model:MODELS[0].id, custom:'', aspect:'1:1', size:'1k', batch:1, count:1, seed:'', helper:'disable', mode:'', style:'', styleCustom:'', sampler:'', steps:'', cfg:'', negative:'', loras:[], refs:[], i2i:null, i2iStr:0.55, profile:'', sizeW:1408, sizeH:1408, palette:null, priority:''});
+const defParams = () => ({model:MODELS[0].id, custom:'', aspect:'1:1', size:'1k', batch:1, count:1, seed:'', helper:'disable', mode:'', style:'', styleCustom:'', sampler:'', steps:'', cfg:'', negative:'', loras:[], refs:[], i2i:null, i2iStr:0.55, profile:'', sizeW:1408, sizeH:1408, palette:null, priority:'', clipSkip:'', adetailer:false, hires:'', hiresStr:0.6});
 let SINGLE = Object.assign({prompt:'', params:defParams()}, lsGet('pxs.single', {}));
 SINGLE.params = Object.assign(defParams(), SINGLE.params || {});
 let PROJECTS = lsGet('pxs.projects', null);
@@ -287,35 +345,38 @@ const v1Base = () => DESK ? API : S.relayUrl;   // v1(무제한 레인·업로�
 function v2Body(j){
   const p = j.p, f = fam(p);
   const b = {modelVersionId:modelId(p), prompt:j.prompt, aspectRatio:p.aspect, size:p.size, batchSize:+p.batch, seed:j.seed, promptHelper:p.helper};
-  if (p.negative.trim() && !p.refs.length) b.negativePrompt = p.negative.trim();
-  if (f === 'tsubaki2' && p.mode) b.mode = p.mode;
-  if (f === 'tsubaki2' && p.style && !p.refs.length) b.style = p.style === '__custom' ? {type:'custom', custom:p.styleCustom} : {type:'preset', key:p.style};
-  if (f === 'sdxl' && (p.sampler || p.steps || p.cfg)){
-    b.sampling = {}; if (p.sampler) b.sampling.method = p.sampler; if (p.steps) b.sampling.steps = +p.steps; if (p.cfg) b.sampling.cfgScale = +p.cfg;
-  }
-  const ls = p.loras.filter(l => l.id).slice(0, 5); if (ls.length && !p.refs.length) b.loras = ls.map(l => ({modelId:l.id, weight:+l.w}));
-  if (p.refs.length) b.contextImages = p.refs.map(r => r.mediaId).slice(0, 3);
+  const ctx = p.refs.length > 0 && feat(p, 'contextImages');
+  if (p.negative.trim() && !ctx && feat(p, 'negativePrompt')) b.negativePrompt = p.negative.trim();
+  if (f === 'tsubaki2' && profOf(p)) b.mode = profOf(p);   // Tsubaki.2 모드 = 품질 프로필(lite~ultra)
+  if (f === 'tsubaki2' && p.style && !ctx) b.style = p.style === '__custom' ? {type:'custom', custom:p.styleCustom} : {type:'preset', key:p.style};
+  const ls = p.loras.filter(l => l.id).slice(0, 5); if (ls.length && !ctx && feat(p, 'lora')) b.loras = ls.map(l => ({modelId:l.id, weight:+l.w}));
+  if (ctx) b.contextImages = p.refs.map(r => r.mediaId).slice(0, 3);
   return b;
 }
 // v1 parameters. 가격 미리보기(/v2/task-price)도 같은 모양을 받는다.
 // 레퍼런스(contextImages)는 LoRA·스타일 키·팔레트·네거티브와 같이 못 쓴다(모델 features 조회 2026-09) → 레퍼런스가 있으면 그쪽을 뺀다.
 function v1Params(j){
   const p = j.p, f = fam(p), par = {prompts:j.prompt, modelId:modelId(p), width:j.w, height:j.h, batchSize:+p.batch || 1, seed:j.seed};
-  const ctx = p.refs.length > 0 && !hasI2i(p);
+  const ctx = p.refs.length > 0 && !hasI2i(p) && feat(p, 'contextImages');
   if (hasI2i(p)){ par.mediaId = p.i2i.mediaId; par.strength = +p.i2iStr || 0.55; }
   if (ctx) par.contextImages = p.refs.map(r => r.mediaId).slice(0, 3);
   else {
-    if (p.negative.trim()) par.negativePrompts = p.negative.trim();
-    const ls = p.loras.filter(l => l.id).slice(0, 5); if (ls.length){ par.lora = {}; for (const l of ls) par.lora[l.id] = +l.w; }
-    if (f === 'tsubaki3' && p.style) par.modelStyle = p.style === '__custom' ? {type:'custom', custom:p.styleCustom} : {type:'key', keyId:p.style};
-    if (f === 'tsubaki3' && p.palette) par.colorPalette = p.palette;
+    if (p.negative.trim() && feat(p, 'negativePrompt')) par.negativePrompts = p.negative.trim();
+    const ls = p.loras.filter(l => l.id).slice(0, 5); if (ls.length && feat(p, 'lora')){ par.lora = {}; for (const l of ls) par.lora[l.id] = +l.w; }
+    if (p.style && feat(p, 'styleKey')) par.modelStyle = p.style === '__custom' ? {type:'custom', custom:p.styleCustom} : {type:'key', keyId:p.style};
+    if (p.palette && feat(p, 'colorPalette')) par.colorPalette = p.palette;
   }
-  if (f === 'tsubaki3' && p.profile) par.inferenceProfile = p.profile;
+  const prof = profOf(p);
+  if (prof && feat(p, 'inferenceProfile')) par.inferenceProfile = prof;
   if (hasPriority(p)) par.priority = effPriority(p);
-  if (f === 'sdxl'){
-    if (p.sampler) par.samplingMethod = p.sampler; if (p.steps) par.samplingSteps = +p.steps; if (p.cfg) par.cfgScale = +p.cfg;
-    if (hasCn(p)) par.controlNets = p.cn.filter(c => c.mediaId).slice(0, 10).map(c => ({type:c.type, mediaId:c.mediaId, weight:c.weight === '' || c.weight == null || isNaN(+c.weight) ? 1 : +c.weight}));   // 0은 유효한 값
-  }
+  const num = v => v !== '' && v != null && !isNaN(+v);
+  if (num(p.cfg) && feat(p, 'cfgScale')) par.cfgScale = +p.cfg;
+  if (num(p.steps) && feat(p, 'samplingSteps')) par.samplingSteps = +p.steps;
+  if (p.sampler && feat(p, 'samplingMethod')) par.samplingMethod = p.sampler;
+  if (num(p.clipSkip) && feat(p, 'clipSkip')) par.clipSkip = +p.clipSkip;
+  if (p.adetailer && feat(p, 'enableADetailer')) par.enableADetailer = true;
+  if (num(p.hires) && +p.hires > 1 && feat(p, 'upscale')){ par.upscale = +p.hires; par.upscaleDenoisingStrength = +p.hiresStr || 0.6; par.upscaleDenoisingSteps = 20; }
+  if (hasCn(p)) par.controlNets = p.cn.filter(c => c.mediaId).slice(0, 10).map(c => ({type:c.type, mediaId:c.mediaId, weight:c.weight === '' || c.weight == null || isNaN(+c.weight) ? 1 : +c.weight}));   // 0은 유효한 값
   return par;
 }
 function v1Body(j){
@@ -493,21 +554,31 @@ async function runJob(j){
 }
 const hasI2i = p => !!(p.i2i && p.i2i.mediaId);
 // v1 유료로만 되는 것: i2i · 직접 크기(1.5k 초과) · 울트라 프로필 · 팔레트 · Tsubaki.3 스타일 키
-const hasCn = p => fam(p) === 'sdxl' && Array.isArray(p.cn) && p.cn.some(c => c.mediaId);
-function needsV1(p){ return hasI2i(p) || hasCn(p) || (fam(p) === 'tsubaki3' && (p.size === 'custom' || p.profile === 'ultra' || !!p.palette || !!p.style)); }
-const CN_TYPES = ['canny', 'depth', 'openpose', 'openpose_full'];   // SDXL 허용 목록(웹 번들). Tsubaki.3은 controlnet 기능 off
+const hasCn = p => feat(p, 'controlnet') && Array.isArray(p.cn) && p.cn.some(c => c.mediaId);
+const V2_MODELS = new Set([T3_ID, T2_ID]);   // v2 /image/create로 실측한 모델만
+function needsV1(p){
+  if (hasI2i(p) || hasCn(p) || !V2_MODELS.has(modelId(p)) || p.size === 'custom') return true;
+  const prof = profOf(p);
+  if (fam(p) === 'tsubaki3' && ((prof && prof !== 'pro' && feat(p, 'inferenceProfile')) || (!!p.palette && feat(p, 'colorPalette')) || (!!p.style && feat(p, 'styleKey')))) return true;   // v2엔 T3 프로필(기본 pro 밖)·팔레트·스타일 키 필드가 없다
+  // 모델이 받지 않아 v1Params에서 빠질 옵션은 경로 판정에도 세지 않는다
+  const num = v => v !== '' && v != null && !isNaN(+v);
+  return (num(p.clipSkip) && feat(p, 'clipSkip')) || (!!p.adetailer && feat(p, 'enableADetailer')) || (num(p.hires) && +p.hires > 1 && feat(p, 'upscale'))
+    || (num(p.cfg) && feat(p, 'cfgScale')) || (num(p.steps) && feat(p, 'samplingSteps')) || (!!p.sampler && feat(p, 'samplingMethod'));
+}
+const CN_TYPES = ['canny', 'depth', 'openpose', 'openpose_full'];   // SDXL 허용 목록(웹 번들). controlnet 기능이 켜진 모델에서만 보인다
 // 무제한 레인 조건: Tsubaki.3 · 배치 1 · 레퍼런스·i2i 없음 (패스는 text to image만 받는다)
-function isRelay(p){ return S.relayOn && fam(p) === 'tsubaki3' && +p.batch === 1 && !p.refs.length && !needsV1(p); }
+function isRelay(p){ return S.relayOn && modelId(p) === T3_ID && +p.batch === 1 && !p.refs.length && !needsV1(p); }   // 무제한 패스는 Tsubaki.3(정본 버전)만
 // 경로: relay = v1 무제한 레인 · v1 = v1 유료 · v2 = v2 유료
 // 우선순위(v1 priority · 웹 번들 enum default 1000 · turboMode 500 · low 0). v2 본문에는 필드가 없어 v1로 보낸다.
 // 무제한 레인은 자기 대기열을 쓰므로 우선순위가 걸려 있어도 레인이 먼저다.
-// Tsubaki.2의 모드·스타일은 v2 필드라 v1로 넘기면 빠진다 → 그 조합에선 우선순위를 걸지 않는다(v1 대응 필드 미실측)
-const t2Locked = p => fam(p) === 'tsubaki2' && !!(p.mode || p.style);
+
 // 실제로 보낼 우선순위. '' = 자동: 멤버십이면 터보(500 · 추가 비용 없음), 아니면 생략(= 서버 기본 높은 우선순위 1000 · 추가 비용).
 // 자동은 헬퍼를 켰으면 쓰지 않는다(v1으로 넘어가면 헬퍼가 빠짐). null = 필드를 보내지 않음.
+// 터보는 공식 모델에서만 자동으로 쓴다. 마켓 모델(Anima)은 터보 3건이 25분 넘게 시작하지 않았고 높은 우선순위는 20초 만에 돌았다(2026-09-27 실측)
+function turboOk(p){ const m = modelOf(p); return BUILTIN_MODELS.some(b => b.id === m.id) || !!m.official; }
 function effPriority(p){
-  if (t2Locked(p) || p.priority === 'omit') return null;   // 'omit' = 큐에 넣을 때 「보내지 않음」으로 고정된 자동값
-  if (p.priority === '' || p.priority == null) return MEMBER && p.helper !== 'enable' ? 500 : null;
+  if (p.priority === 'omit') return null;   // 'omit' = 큐에 넣을 때 「보내지 않음」으로 고정된 자동값
+  if (p.priority === '' || p.priority == null) return MEMBER && p.helper !== 'enable' && turboOk(p) ? 500 : null;
   return +p.priority;
 }
 const hasPriority = p => effPriority(p) != null;
@@ -554,8 +625,12 @@ async function enqueueInner(jobs){
   if (!S.key && !MOCK){ alert('설정 탭에서 PixAI API 키를 먼저 넣어 주세요.'); go('settings'); return; }
   if (jobs.some(j => !j.prompt.trim())){ alert('프롬프트가 비어 있는 작업이 있습니다.'); return; }
   if (jobs.some(j => !modelId(j.p))){ alert('모델 버전 ID를 입력해 주세요.'); return; }
-  // 라이브러리가 아는 계열과 모델 계열이 다른 LoRA는 보내지 않는다(PixAI가 거부하거나 과금 뒤 실패)
-  const wrong = jobs.map(j => (!j.kind || j.kind === 'gen') && LORA_BASE[fam(j.p)] ? (j.p.loras || []).map(l => LORAS.find(x => x.id === l.id)).find(x => x && x.base && x.base !== LORA_BASE[fam(j.p)]) : null).find(Boolean);
+  // 모델 정보(종류·기능·최대 크기)를 아직 못 읽었으면 기다렸다가 경로·크기를 다시 정한다 — 폼을 거치지 않은 작업도 모델 한도대로 나가게
+  const gens = jobs.filter(j => !j.kind || j.kind === 'gen');
+  await Promise.all([...new Set(gens.map(j => modelId(j.p)))].map(id => loadModelInfo(id, (MODELS.find(m => m.id === id) || {}).type)));
+  for (const j of gens){ j.via = routeOf(j.p); [j.w, j.h] = dims(j.p, j.via === 'relay'); }
+  // 라이브러리가 아는 계열과 모델 계열이 다른 LoRA는 보내지 않는다(PixAI가 거부하거나 과금 뒤 실패). 모델 정보를 읽은 뒤에 본다
+  const wrong = gens.map(j => modelType(j.p) && feat(j.p, 'lora') ? (j.p.loras || []).map(l => LORAS.find(x => x.id === l.id)).find(x => x && x.base && x.base !== modelType(j.p)) : null).find(Boolean);
   if (wrong){ alert(`LoRA 「${wrong.alias}」는 이 모델 계열용이 아닙니다. 빼거나 모델을 바꿔 주세요.`); return; }
   if (!DESK && !MOCK && !S.relayOn && jobs.some(j => j.via === 'v1')){ alert('i2i는 PixAI가 브라우저 직접 호출을 막아 둔 경로라 창 앱(exe)이나 relay.py 릴레이에서만 됩니다.'); return; }
   const paid = jobs.filter(j => j.via !== 'relay');
@@ -650,73 +725,88 @@ function paramsForm(p, onChange, opts = {}){
   const ch = () => { onChange(); saveSoon(); };
   const draw = () => {
     box.replaceChildren();
-    const f = fam(p);
+    const f = fam(p), LB = modelType(p), mx = maxSide(p), inf = INFO[modelId(p)] || {};
+    loadModelInfo(modelId(p), modelOf(p).type);   // 모델 기능 목록이 오면 다시 그린다
     const sel = (val, list, set) => h('select', {onchange:e => { set(e.target.value); ch(); draw(); }}, list.map(([v, t]) => h('option', {value:v, selected:v === val}, t)));
     const [w, hh] = dims(p, false);
     const relay = isRelay(p);
     box.append(
       h('div', {class:'row'},
-        h('div', {}, h('label', {class:'f'}, '모델'), sel(p.model, MODELS.map(m => [m.id, m.name]), v => p.model = v)),
+        h('div', {}, h('label', {class:'f'}, '모델'), sel(p.model, [...MODELS.map(m => [m.id, m.name]), ...(MODELS.some(m => m.id === p.model) ? [] : [[p.model, modelOf(p).name]])], v => p.model = v)),
+        DESK ? h('div', {class:'nf'}, h('label', {class:'f'}, '\u00a0'), h('button', {class:'sm', title:'PixAI의 공식 모델·SDXL·SD1.5·Anima·Z-Image 모델을 찾아 목록에 추가', onclick:() => modelSearch(p, () => { ch(); draw(); })}, '모델 찾기')) : null,
         p.model === 'custom' ? h('div', {}, h('label', {class:'f'}, '버전 ID'), h('input', {type:'text', value:p.custom, placeholder:'모델 페이지 URL 마지막 숫자', oninput:e => { p.custom = e.target.value; ch(); }})) : null),
       h('div', {class:'row'},
         h('div', {}, h('label', {class:'f'}, '비율'), sel(p.aspect, Object.keys(RES).map(k => [k, k]), v => p.aspect = v)),
-        h('div', {}, h('label', {class:'f'}, '크기'), sel(p.size, [['1k', '1k'], ['1.5k', '1.5k'], ...(f === 'tsubaki3' ? [['custom', '직접 입력 (최대 2496)']] : [])], v => p.size = v)),
+        h('div', {}, h('label', {class:'f'}, '크기'), sel(p.size, [['1k', '1k'], ['1.5k', '1.5k'], ...(mx ? [['custom', `직접 입력 (최대 ${mx})`]] : [])], v => p.size = v)),
         h('div', {}, h('label', {class:'f'}, '배치'), sel(String(p.batch), [['1', '1'], ['4', '4']], v => p.batch = +v))),
-      p.size === 'custom' && f === 'tsubaki3' ? h('div', {class:'row'},
-        h('div', {}, h('label', {class:'f'}, '너비 (512~2496)'), h('input', {type:'number', min:512, max:2496, step:16, value:p.sizeW, onchange:e => { p.sizeW = snap16(e.target.value, 512, 2496); ch(); draw(); }})),
-        h('div', {}, h('label', {class:'f'}, '높이 (512~2496)'), h('input', {type:'number', min:512, max:2496, step:16, value:p.sizeH, onchange:e => { p.sizeH = snap16(e.target.value, 512, 2496); ch(); draw(); }})),
-        h('div', {class:'nf'}, h('label', {class:'f'}, '빠른 선택'), sel('', [['', '프리셋'], ['1408x1408', '1:1 1408'], ['1232x1632', '3:4 1232×1632'], ['1152x1744', '2:3 1152×1744'], ['1104x1824', '3:5 1104×1824'], ['1056x1888', '9:16 1056×1888'], ['1632x1232', '4:3 1632×1232'], ['1888x1056', '16:9 1888×1056']], v => { if (v){ const [a, b] = v.split('x'); p.sizeW = +a; p.sizeH = +b; } }))) : '',   // DOM append(null)은 "null" 글자를 찍는다
+      p.size === 'custom' && mx ? h('div', {class:'row'},
+        h('div', {}, h('label', {class:'f'}, `너비 (512~${mx})`), h('input', {type:'number', min:512, max:mx, step:16, value:p.sizeW, onchange:e => { p.sizeW = snap16(e.target.value, 512, mx); ch(); draw(); }})),
+        h('div', {}, h('label', {class:'f'}, `높이 (512~${mx})`), h('input', {type:'number', min:512, max:mx, step:16, value:p.sizeH, onchange:e => { p.sizeH = snap16(e.target.value, 512, mx); ch(); draw(); }})),
+        mx < 1888 ? '' : h('div', {class:'nf'}, h('label', {class:'f'}, '빠른 선택'), sel('', [['', '프리셋'], ['1408x1408', '1:1 1408'], ['1232x1632', '3:4 1232×1632'], ['1152x1744', '2:3 1152×1744'], ['1104x1824', '3:5 1104×1824'], ['1056x1888', '9:16 1056×1888'], ['1632x1232', '4:3 1632×1232'], ['1888x1056', '16:9 1888×1056']], v => { if (v){ const [a, b] = v.split('x'); p.sizeW = +a; p.sizeH = +b; } }))) : '',   // DOM append(null)은 "null" 글자를 찍는다
       h('div', {class:'faint'}, `${w}×${hh}px`, relay ? ` · 무제한 레인은 ${dims(p, true).join('×')}px로 보냄` : ''),
       h('div', {class:'row'},
         h('div', {}, h('label', {class:'f'}, opts.countLabel || '반복 횟수'), h('input', {type:'number', min:1, max:100, value:p.count, oninput:e => { p.count = e.target.value; ch(); }})),
         h('div', {}, h('label', {class:'f'}, '시드 (비우면 무작위)'), h('input', {type:'text', value:p.seed, placeholder:'무작위', oninput:e => { p.seed = e.target.value.replace(/[^\d]/g, ''); e.target.value = p.seed; ch(); }})),
         h('div', {}, h('label', {class:'f'}, '프롬프트 헬퍼'), sel(p.helper, [['disable', '끔'], ['enable', '켬']], v => p.helper = v))),
-      t2Locked(p)
-        ? h('div', {class:'faint'}, '우선순위는 Tsubaki.2의 모드·스타일과 같이 쓸 수 없어 높은 우선순위(기본)로 나갑니다.')
-        : h('div', {}, h('label', {class:'f'}, '우선순위 (PixAI 대기열 · 공식 설명 기준)'),
+      h('div', {}, h('label', {class:'f'}, '우선순위 (PixAI 대기열 · 공식 설명 기준)'),
             sel(p.priority == null || p.priority === 'omit' ? '' : String(p.priority), [
-              ['', '자동 — ' + (MEMBER ? (p.helper === 'enable' ? '헬퍼 켬이라 높은 우선순위' : '멤버십이라 터보') : MEMBER === false ? '비회원이라 높은 우선순위' : '계정 확인 전 · 높은 우선순위')],
+              ['', '자동 — ' + (MEMBER ? (p.helper === 'enable' ? '헬퍼 켬이라 높은 우선순위' : turboOk(p) ? '멤버십이라 터보' : '마켓 모델이라 높은 우선순위') : MEMBER === false ? '비회원이라 높은 우선순위' : '계정 확인 전 · 높은 우선순위')],
               ['1000', '높은 우선순위 (최대 10배 · 추가 비용)'],
               ['500', '터보 (최대 7.6배 · 멤버십 전용 · 추가 비용 없음)'],
               ['0', '낮은 우선순위 (수십 분 대기 · 추가 비용 없음)']], v => p.priority = v),
-            MEMBER === false && String(p.priority) === '500' ? h('div', {class:'faint', style:'color:var(--warn)'}, '터보는 멤버십 전용입니다. 비회원 계정은 낮은 우선순위로 처리될 수 있습니다(미확인).') : ''),
+            MEMBER === false && String(p.priority) === '500' ? h('div', {class:'faint', style:'color:var(--warn)'}, '터보는 멤버십 전용입니다. 비회원 계정은 낮은 우선순위로 처리될 수 있습니다(미확인).') : '',
+            String(p.priority) === '500' && !turboOk(p) ? h('div', {class:'faint', style:'color:var(--warn)'}, '마켓 모델은 터보 대기열에서 오래 멈춘 적이 있습니다(Anima 3건 25분 넘게 대기 · 2026-09 실측).') : ''),
       p.helper === 'enable' && routeOf(p) !== 'v2' ? h('div', {class:'faint', style:'color:var(--warn)'}, '지금 설정은 v1 경로로 나가서 프롬프트 헬퍼가 적용되지 않습니다.') : '',
     );
-    if (f === 'tsubaki2') box.append(h('div', {}, h('label', {class:'f'}, '모드 (Tsubaki.2)'), sel(p.mode, [['', '기본'], ['lite', 'lite'], ['standard', 'standard'], ['pro', 'pro'], ['ultra', 'ultra']], v => p.mode = v)));
-    if (f === 'tsubaki2' || f === 'tsubaki3'){
-      const skThumb = f === 'tsubaki3' && p.style && p.style !== '__custom' && STYLE_THUMBS[p.style];
-      box.append(h('div', {}, h('label', {class:'f'}, f === 'tsubaki3' ? '스타일 키 (그림체 프리셋)' : '스타일 프리셋'),
-        h('div', {class:'row'}, sel(p.style, [['', '없음'], ...STYLES.map(s => [s, s]), ['__custom', '직접 입력']], v => p.style = v),
-          skThumb ? h('img', {class:'nf', src:skThumb, style:'width:44px;height:44px;object-fit:cover;border-radius:4px;border:1px solid var(--line)'}) : null)));
+    // 품질 프로필: 모델이 알려 준 목록(Tsubaki.2의 옛 「모드」도 여기로)
+    const profs = inf.profiles && inf.profiles.length ? inf.profiles
+      : f === 'tsubaki3' ? [{name:'pro', title:'프로'}, {name:'ultra', title:'울트라'}] : f === 'tsubaki2' ? ['lite', 'standard', 'pro', 'ultra'].map(n => ({name:n, title:n})) : [];
+    if (feat(p, 'inferenceProfile') && profs.length) box.append(h('div', {}, h('label', {class:'f'}, '품질 프로필'),
+      sel(profOf(p), [['', '기본'], ...profs.map(x => [x.name, x.title && x.title !== x.name ? `${x.title} (${x.name})` : x.name])], v => { p.profile = v; p.mode = ''; })));
+    // 스타일 키: 모델별 목록
+    if (feat(p, 'styleKey')){
+      const keys = inf.styleKeys && inf.styleKeys.length ? inf.styleKeys : STYLES.map(id => ({id, thumb:STYLE_THUMBS[id]}));
+      const th = p.style && p.style !== '__custom' && (keys.find(k => k.id === p.style) || {}).thumb;
+      box.append(h('div', {}, h('label', {class:'f'}, '스타일 키 (그림체 프리셋)'),
+        h('div', {class:'row'}, sel(p.style, [['', '없음'], ...keys.map(k => [k.id, k.id]), ['__custom', '직접 입력']], v => p.style = v),
+          th ? h('img', {class:'nf', src:th, style:'width:44px;height:44px;object-fit:cover;border-radius:4px;border:1px solid var(--line)'}) : null)));
       if (p.style === '__custom') box.append(h('input', {type:'text', value:p.styleCustom, placeholder:'스타일 문자열', oninput:e => { p.styleCustom = e.target.value; ch(); }}));
     }
-    if (f === 'tsubaki3'){
-      box.append(h('div', {class:'row'},
-        h('div', {}, h('label', {class:'f'}, '품질 프로필'), sel(p.profile, [['', '프로 (기본 · 28스텝)'], ['ultra', '울트라 (50스텝 · 멤버십)']], v => p.profile = v)),
-        h('div', {}, h('label', {class:'f'}, '컬러 팔레트'), sel(p.palette ? p.palette.name : '', [['', '없음'], ...PALETTES.map(x => [x.name, x.name])], v => { const x = PALETTES.find(y => y.name === v); p.palette = x ? {name:x.name, palette:x.palette} : null; }))));
+    if (feat(p, 'colorPalette')){
+      box.append(h('div', {}, h('label', {class:'f'}, '컬러 팔레트'), sel(p.palette ? p.palette.name : '', [['', '없음'], ...PALETTES.map(x => [x.name, x.name])], v => { const x = PALETTES.find(y => y.name === v); p.palette = x ? {name:x.name, palette:x.palette} : null; })));
       if (p.palette && p.palette.palette){
         const sw = k => (p.palette.palette[k] && p.palette.palette[k].colors || []).map(c => h('span', {title:`${k} ${c.hex} ${c.ratio}%`, style:`display:inline-block;width:${Math.max(6, c.ratio / 2)}px;height:12px;background:${c.hex}`}));
         box.append(h('div', {class:'faint'}, '전체 ', ...sw('overall'), '  배경 ', ...sw('background'), '  인물 ', ...sw('character'), ' · 팔레트는 머리색까지 물들일 만큼 셉니다'));
       }
     }
-    if (f === 'sdxl') box.append(h('div', {class:'row'},
-      h('div', {}, h('label', {class:'f'}, '샘플러'), sel(p.sampler, [['', '기본'], ...SAMPLERS.map(s => [s, s])], v => p.sampler = v)),
-      h('div', {}, h('label', {class:'f'}, '스텝'), h('input', {type:'number', min:1, max:100, value:p.steps, oninput:e => { p.steps = e.target.value; ch(); }})),
-      h('div', {}, h('label', {class:'f'}, 'CFG'), h('input', {type:'number', step:'0.5', value:p.cfg, oninput:e => { p.cfg = e.target.value; ch(); }}))));
+    // 샘플링·세부 옵션: 켜진 기능만
+    const num = (label, key, attrs) => h('div', {}, h('label', {class:'f'}, label), h('input', Object.assign({type:'number', value:p[key], placeholder:'기본', oninput:e => { p[key] = e.target.value; ch(); }}, attrs)));
+    const samp = [
+      feat(p, 'samplingMethod') ? h('div', {}, h('label', {class:'f'}, '샘플러'), sel(p.sampler, [['', '기본'], ...SAMPLERS.map(x => [x, x])], v => p.sampler = v)) : null,
+      feat(p, 'samplingSteps') ? num('스텝', 'steps', {min:1, max:100}) : null,
+      feat(p, 'cfgScale') ? num('CFG', 'cfg', {step:'0.5', min:1, max:30}) : null,
+      feat(p, 'clipSkip') ? num('클립 스킵', 'clipSkip', {min:1, max:12}) : null].filter(Boolean);
+    if (samp.length) box.append(h('div', {class:'row'}, ...samp));
+    const hl = () => `고해상도 보정 강도 ${(+p.hiresStr || 0.6).toFixed(2)}`;
+    const extra = [
+      feat(p, 'upscale') ? h('div', {}, h('label', {class:'f'}, '고해상도 보정 (hires · 유료)'), sel(p.hires || '', [['', '끔'], ['1.5', '1.5배'], ['2', '2배']], v => p.hires = v)) : null,
+      feat(p, 'upscale') && p.hires ? h('div', {}, h('label', {class:'f'}, hl()), h('input', {type:'range', min:0.3, max:0.8, step:0.05, value:+p.hiresStr || 0.6, style:'width:100%', oninput:e => { p.hiresStr = +e.target.value; e.target.previousSibling.textContent = hl(); saveSoon(); }})) : null,
+      feat(p, 'enableADetailer') ? h('label', {class:'nf', style:'align-self:end'}, h('input', {type:'checkbox', checked:!!p.adetailer, onchange:e => { p.adetailer = e.target.checked; ch(); draw(); }}), ' ADetailer (얼굴 자동 보정)') : null].filter(Boolean);
+    if (extra.length) box.append(h('div', {class:'row'}, ...extra));
     // LoRA
-    const lb = h('div', {}, h('label', {class:'f'}, `LoRA (최대 5 · 베이스 모델과 같은 계열만)`));
+    const lb = h('div', {}, h('label', {class:'f'}, feat(p, 'lora') ? 'LoRA (최대 5 · 이 모델 계열용만)' : 'LoRA — 이 모델은 LoRA를 받지 않습니다'));
     p.loras.forEach((l, i) => {
       const lib = LORAS.find(x => x.id === l.id);
       lb.append(h('div', {class:'lora-row'},
         h('select', {onchange:e => { const x = LORAS.find(y => y.id === e.target.value); l.id = e.target.value; if (x) l.w = x.w; ch(); draw(); }},
-          h('option', {value:''}, '선택'), LORAS.filter(x => !x.base || x.base === LORA_BASE[f] || x.id === l.id).map(x => h('option', {value:x.id, selected:x.id === l.id}, x.alias + (x.base && x.base !== LORA_BASE[f] ? ' (다른 모델용)' : '')))),
+          h('option', {value:''}, '선택'), LORAS.filter(x => !x.base || x.base === LB || x.id === l.id).map(x => h('option', {value:x.id, selected:x.id === l.id}, x.alias + (x.base && x.base !== LB ? ' (다른 모델용)' : '')))),
         h('input', {type:'number', step:'0.05', min:0, max:1, value:l.w, oninput:e => { l.w = e.target.value; ch(); }}),
         h('button', {class:'sm', title:'빼기', onclick:() => { p.loras.splice(i, 1); ch(); draw(); }}, '×')));
       if (lib && lib.trigger && opts.onTrigger) lb.append(h('div', {class:'faint'}, '트리거: ' + lib.trigger + ' ', h('button', {class:'sm', onclick:() => opts.onTrigger(lib.trigger)}, '프롬프트에 넣기')));
     });
-    if (p.loras.length < 5) lb.append(h('button', {class:'sm', onclick:() => { p.loras.push({id:'', w:0.6}); ch(); draw(); }}, '+ LoRA'));
-    if (DESK && LORA_BASE[f]) lb.append(' ', h('button', {class:'sm', title:'PixAI 마켓에서 이 모델용 LoRA 검색', onclick:() => loraSearch(p, () => { ch(); draw(); })}, 'LoRA 찾기'));
-    box.append(lb);
+    if (p.loras.length < 5 && feat(p, 'lora')) lb.append(h('button', {class:'sm', onclick:() => { p.loras.push({id:'', w:0.6}); ch(); draw(); }}, '+ LoRA'));
+    if (DESK && LB && feat(p, 'lora')) lb.append(' ', h('button', {class:'sm', title:'PixAI 마켓에서 이 모델용 LoRA 검색', onclick:() => loraSearch(p, () => { ch(); draw(); })}, 'LoRA 찾기'));
+    if (feat(p, 'lora') || p.loras.length) box.append(lb);
     // 레퍼런스
     const rb = h('div', {}, h('label', {class:'f'}, '레퍼런스 이미지 (최대 3 · 프롬프트에서 @image1로 지칭 · 유료)'));
     const refs = h('div', {class:'refs'});
@@ -728,9 +818,10 @@ function paramsForm(p, onChange, opts = {}){
         try { const r = await api.upload(file); REFTHUMB.set(String(r.id), URL.createObjectURL(file)); p.refs.push({mediaId:String(r.id)}); ch(); draw(); }
         catch (err){ alert('업로드 실패: ' + err.message); }
       }})));
-    box.append(rb);
-    // ControlNet (SDXL 모델만)
-    if (f === 'sdxl'){
+    if (feat(p, 'contextImages') || p.refs.length) box.append(rb);
+    if (p.refs.length && !feat(p, 'contextImages')) box.append(h('div', {class:'faint', style:'color:var(--warn)'}, '이 모델은 레퍼런스 이미지를 받지 않아 보내지 않습니다.'));
+    // ControlNet (controlnet 기능이 켜진 모델만 · SDXL)
+    if (feat(p, 'controlnet')){
       if (!Array.isArray(p.cn)) p.cn = [];
       const cb = h('div', {}, h('label', {class:'f'}, 'ControlNet (SDXL · 유료 · 윤곽·깊이·포즈를 이미지에서 따라감)'));
       p.cn.forEach((c, i) => { const th = refThumb(c.mediaId); cb.append(h('div', {class:'row', style:'margin-bottom:4px'},
@@ -762,10 +853,10 @@ function paramsForm(p, onChange, opts = {}){
         catch (err){ alert('업로드 실패: ' + err.message); }
       }})));
     box.append(ib);
-    box.append(h('div', {}, h('label', {class:'f'}, '네거티브'), h('textarea', {rows:2, oninput:e => { p.negative = e.target.value; ch(); }}, p.negative)));
+    if (feat(p, 'negativePrompt')) box.append(h('div', {}, h('label', {class:'f'}, '네거티브'), h('textarea', {rows:2, oninput:e => { p.negative = e.target.value; ch(); }}, p.negative)));
     const route = routeOf(p), rl = route === 'relay' ? '무제한 레인' : hasI2i(p) ? 'i2i 유료' : '유료';
     const badge = h('span', {class:'badge ' + (route === 'relay' ? 'free' : 'paid')}, route === 'relay' ? '무제한 레인 · 0 크레딧' : rl + (MOCK || !S.key ? '' : ' · 가격 확인 중…'));
-    const clash = p.refs.length && !hasI2i(p) && (p.loras.some(l => l.id) || p.style || p.palette || p.negative.trim());
+    const clash = p.refs.length && !hasI2i(p) && feat(p, 'contextImages') && (p.loras.some(l => l.id) || p.style || p.palette || p.negative.trim());
     box.append(h('div', {}, badge, clash ? h('div', {class:'faint', style:'margin-top:4px;color:var(--warn)'}, '레퍼런스를 쓰면 LoRA·스타일 키·팔레트·네거티브는 빠집니다 (PixAI 제약)') : null));
     if (route !== 'relay' && !MOCK && S.key){
       clearTimeout(PRICE_T);
@@ -1191,7 +1282,7 @@ function openLB(rec, hist){
     h('div', {class:'row', style:'gap:6px;margin-top:6px'},
       h('button', {class:'sm nf', disabled:!rec.mediaId || null, title:rec.mediaId ? '' : 'mediaId 없음', onclick:() => { const p = toForm(); if (p.refs.length >= 3){ alert('레퍼런스는 최대 3장'); return; } if (p.refs.some(r => r.mediaId === rec.mediaId)) return; p.refs.push({mediaId:rec.mediaId}); saveAll(); close(); render(); }}, '레퍼런스로'),
       h('button', {class:'sm nf', disabled:!rec.mediaId || null, title:rec.mediaId ? '이 이미지를 원본으로 다시 그리기' : 'mediaId 없음', onclick:() => { const p = toForm(); p.i2i = {mediaId:rec.mediaId}; saveAll(); close(); render(); }}, 'i2i 원본으로'),
-      fam(toForm()) === 'sdxl' ? h('button', {class:'sm nf', disabled:!rec.mediaId || null, title:'SDXL 모델의 ControlNet 입력으로', onclick:() => { const p = toForm(); if (!Array.isArray(p.cn)) p.cn = []; p.cn.push({type:'canny', mediaId:rec.mediaId, weight:1}); saveAll(); close(); render(); }}, '컨트롤넷으로') : null,
+      feat(toForm(), 'controlnet') ? h('button', {class:'sm nf', disabled:!rec.mediaId || null, title:'지금 모델(SDXL 등)의 ControlNet 입력으로', onclick:() => { const p = toForm(); if (!Array.isArray(p.cn)) p.cn = []; p.cn.push({type:'canny', mediaId:rec.mediaId, weight:1}); saveAll(); close(); render(); }}, '컨트롤넷으로') : null,
       h('button', {class:'sm nf danger', onclick:async () => { if (!confirm(isVid(rec) ? '이 영상을 지울까요?' : '이 이미지를 지울까요?')) return; await DB.del('images', rec.id); IMAGES = IMAGES.filter(r => r.id !== rec.id); if (URLS.has(rec.id)){ URL.revokeObjectURL(URLS.get(rec.id)); URLS.delete(rec.id); } GSEL.delete(rec.id); close(); render(); }}, '삭제')),
     // 편집 도구: PixAI에 올라간 이미지(mediaId)만. 창 앱 또는 릴레이에서.
     rec.mediaId && !isVid(rec) && (DESK || S.relayOn || MOCK) ? [h('div', {class:'muted', style:'margin-top:10px'}, '편집 도구 (유료 · 결과는 갤러리에 새로 추가)'),
@@ -1365,13 +1456,14 @@ async function chatEditModal(rec){
   upd();
 }
 /* LoRA 찾기 (PixAI 마켓 · GraphQL generationModels{keyword, loraBaseModelTypes} · 2026-09-27 실측)
-   모델 계열마다 붙는 LoRA 기반 타입이 다르다: Tsubaki.3 MMDIT26B · Tsubaki.2 MMDIT26A · SDXL. 트리거는 버전 extra.triggerWords. */
-const LORA_BASE = {tsubaki3:'MMDIT26B_MODEL', tsubaki2:'MMDIT26A_MODEL', sdxl:'SDXL_MODEL'};
+   LoRA 계열(loraBaseModelTypes) = 붙일 모델의 종류(generationModel.type). 트리거는 버전 extra.triggerWords. */
+const TYPE_NAMES = [['MMDIT26B_MODEL', 'Tsubaki.3'], ['MMDIT26A_MODEL', 'Tsubaki.2'], ['SDXL_MODEL', 'SDXL'], ['SD_V1_MODEL', 'SD 1.5'], ['DIT7B_MODEL', 'Tsubaki·Serin'], ['DIT9_MODEL', 'Mio Brush'], ['USER_DIT26A_MODEL', 'Anima'], ['USER_DIT26B_MODEL', 'Z-Image']];
+const typeName = t => (TYPE_NAMES.find(x => x[0] === t) || [0, t || '종류 모름'])[1];
 const thumbOf = m => { const u = (m && m.media && m.media.urls) || []; const t = u.find(x => x.variant === 'THUMBNAIL') || u[0]; return t && t.url; };
 function loraSearch(p, onChange){
   const {card} = modalShell('LoRA 찾기 (PixAI 마켓)', 1040);
-  const base = p ? LORA_BASE[fam(p)] : 'MMDIT26B_MODEL';
-  if (!base){ card.append(h('div', {class:'faint'}, '이 모델은 LoRA 계열을 몰라서 찾을 수 없습니다. 버전 ID를 직접 넣어 주세요.')); return; }
+  let base = p ? modelType(p) : 'MMDIT26B_MODEL';
+  if (!base){ card.append(h('div', {class:'faint'}, '이 모델의 종류를 아직 몰라서 LoRA를 찾을 수 없습니다. 모델 정보를 읽은 뒤 다시 열어 주세요.')); return; }
   const st = {kw:'', after:null, items:[], sort:'ref', blur:true, busy:false, total:0, err:''};
   const kw = h('input', {type:'text', placeholder:'검색어 (예: watercolor, xipa, 캐릭터 이름) · 비우면 전체', onkeydown:e => { if (e.key === 'Enter') run(true); }});
   const info = h('span', {class:'faint'}), grid = h('div', {class:'grid', style:'grid-template-columns:repeat(auto-fill,minmax(220px,1fr))'}), more = h('button', {class:'nf', onclick:() => run(false)}, '더 보기');
@@ -1410,8 +1502,66 @@ function loraSearch(p, onChange){
   card.append(h('div', {class:'row'}, kw, h('button', {class:'pri nf', onclick:() => run(true)}, '검색'),
       h('select', {class:'nf', style:'width:120px', onchange:e => { st.sort = e.target.value; draw(); }}, [['ref', '사용 많은 순'], ['like', '좋아요 순'], ['api', '받은 순서']].map(([a, b]) => h('option', {value:a}, b))),
       h('label', {class:'nf'}, h('input', {type:'checkbox', checked:true, onchange:e => { st.blur = e.target.checked; draw(); }}), ' 성인 썸네일 흐리게')),
-    h('div', {class:'faint'}, `${p ? modelOf(p).name : 'Tsubaki.3'}용(${base})만 찾습니다. 정렬은 불러온 목록 안에서만 합니다.`), info, grid, more);
+    p ? h('div', {class:'faint'}, `${modelOf(p).name}용(${typeName(base)})만 찾습니다. 정렬은 불러온 목록 안에서만 합니다.`)
+      : h('div', {class:'row'}, h('span', {class:'faint nf'}, '모델 계열'), h('select', {class:'nf', style:'width:180px', onchange:e => { base = e.target.value; run(true); }}, TYPE_NAMES.map(([t, n]) => h('option', {value:t, selected:t === base}, n)))),
+    info, grid, more);
   kw.focus(); run(true);
+}
+
+/* 모델 찾기: 공식 = generationModels(feed:"preset") · 마켓 = generationModels(types, keyword) (2026-09-27 실측)
+   추가한 모델은 MYMODELS에 {id:버전 ID, name, type}으로 남고, 기능·크기·프로필은 고를 때 모델별로 읽는다. */
+const MODEL_CATS = [['preset', '공식', null], ['sdxl', 'SDXL', ['SDXL_MODEL']], ['sd1', 'SD 1.5', ['SD_V1_MODEL']], ['anima', 'Anima', ['USER_DIT26A_MODEL']], ['zimage', 'Z-Image', ['USER_DIT26B_MODEL', 'Z_IMAGE_V1_MODEL']]];
+function addMyModel(v, title, type, official){
+  if (!MODELS.some(m => m.id === v)){ MYMODELS.push(Object.assign({id:v, name:title, type}, official ? {official:true} : {})); lsSet('pxs.models', MYMODELS); rebuildModels(); }
+}
+function modelSearch(p, onChange){
+  const {card, close} = modalShell('모델 찾기 (PixAI)', 1040);
+  const st = {cat:'preset', kw:'', after:null, items:[], blur:true, busy:false, total:0, err:''};
+  const kw = h('input', {type:'text', placeholder:'검색어 (모델 이름) · 비우면 전체', onkeydown:e => { if (e.key === 'Enter') run(true); }});
+  const info = h('span', {class:'faint'}), grid = h('div', {class:'grid', style:'grid-template-columns:repeat(auto-fill,minmax(200px,1fr))'}), more = h('button', {class:'nf', onclick:() => run(false)}, '더 보기');
+  const tabs = h('div', {class:'row', style:'gap:4px'});
+  const draw = () => {
+    tabs.replaceChildren(...MODEL_CATS.map(([k, n]) => h('button', {class:'sm nf' + (st.cat === k ? ' pri' : ''), onclick:() => { st.cat = k; run(true); }}, n)));
+    const list = st.cat === 'preset' ? st.items : [...st.items].sort((a, b) => (b.refCount || 0) - (a.refCount || 0));
+    grid.replaceChildren(...list.map(m => {
+      const v = m.latestAvailableVersion || {}, th = thumbOf(v) || thumbOf(m), have = MODELS.some(x => x.id === v.id);
+      return h('div', {class:'card stack', style:'padding:8px'},
+        th ? h('img', {src:th, loading:'lazy', style:`width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;${m.isNsfw && st.blur ? 'filter:blur(14px)' : ''}`}) : h('div', {class:'faint', style:'aspect-ratio:1'}, '썸네일 없음'),
+        h('b', {style:'font-size:13px'}, m.title), h('div', {class:'faint'}, `${typeName(m.type)}${v.name ? ' · ' + v.name : ''} · 사용 ${(m.refCount || 0).toLocaleString()}${m.isNsfw ? ' · 성인' : ''}`),
+        h('div', {class:'row', style:'gap:4px'},
+          p ? h('button', {class:'sm', disabled:!v.id || null, onclick:() => { addMyModel(v.id, m.title, m.type, st.cat === 'preset'); p.model = v.id; p.size = '1k'; saveAll(); onChange && onChange(); close(); }}, '이 모델 쓰기') : null,
+          h('button', {class:'sm', disabled:!v.id || have || null, onclick:() => { addMyModel(v.id, m.title, m.type, st.cat === 'preset'); draw(); if (!p && TAB === 'settings') render(); }}, have ? '목록에 있음' : '목록에 추가')));
+    }));
+    info.textContent = st.err ? '검색 실패: ' + st.err : st.cat === 'preset' ? `공식 모델 ${st.items.length}개` : `${st.total.toLocaleString()}개 중 ${st.items.length}개` + (st.busy ? ' · 불러오는 중…' : '');
+    more.disabled = !st.after || st.busy || null;
+    kw.disabled = st.cat === 'preset' || null;
+  };
+  const F = 'id title type isNsfw refCount media { urls { variant url } } latestAvailableVersion { id name media { urls { variant url } } }';
+  let seq = 0;
+  const run = async reset => {
+    if (st.busy && !reset) return;
+    const my = ++seq;
+    if (reset){ st.kw = kw.value.trim(); st.after = null; st.items = []; st.total = 0; }
+    st.err = ''; st.busy = true; draw();
+    try {
+      if (st.cat === 'preset'){
+        const d = await gql(`{ generationModels(feed: "preset"){ edges { node { ${F} } } } }`);
+        if (my !== seq) return;
+        st.items = d.generationModels.edges.map(e => e.node).filter(m => TYPE_FAM[m.type]);   // 편집용(CHAT) 모델은 뺀다
+      } else {
+        const d = await gql(`query($t: [GenerationModelType], $k: String, $a: String){ generationModels(first: 24, types: $t, keyword: $k, after: $a){ totalCount pageInfo { hasNextPage endCursor } edges { node { ${F} } } } }`,
+          {t:MODEL_CATS.find(c => c[0] === st.cat)[2], k:st.kw || null, a:st.after});
+        if (my !== seq) return;
+        const g = d.generationModels; st.total = g.totalCount; st.items.push(...g.edges.map(e => e.node)); st.after = g.pageInfo.hasNextPage ? g.pageInfo.endCursor : null;
+      }
+    } catch (e){ if (my !== seq) return; st.err = e.message; }
+    st.busy = false; draw();
+  };
+  card.append(tabs, h('div', {class:'row'}, kw, h('button', {class:'pri nf', onclick:() => run(true)}, '검색'),
+      h('label', {class:'nf'}, h('input', {type:'checkbox', checked:true, onchange:e => { st.blur = e.target.checked; draw(); }}), ' 성인 썸네일 흐리게')),
+    h('div', {class:'faint'}, '추가한 모델은 모델 목록에 남습니다. 옵션(크기·프로필·샘플러·LoRA 계열)은 고른 모델이 PixAI에 등록한 기능대로 열립니다. 마켓 목록은 불러온 안에서 사용 많은 순입니다.'),
+    info, grid, more);
+  run(true);
 }
 
 let IMPORT_BUSY = false;
@@ -1421,19 +1571,25 @@ function paramsFromTask(par){
   if (MODELS.some(x => x.id === par.modelId)) p.model = par.modelId; else if (par.modelId){ p.model = 'custom'; p.custom = String(par.modelId); }
   const w = +par.width, hh = +par.height;
   if (w && hh){
-    if (fam(p) === 'tsubaki3'){ p.size = 'custom'; p.sizeW = w; p.sizeH = hh; }
+    if (maxSide(p) && Math.max(w, hh) <= maxSide(p)){ p.size = 'custom'; p.sizeW = w; p.sizeH = hh; }
     else { let best = '1:1', bd = 9; for (const k of Object.keys(RES)){ const [a, b] = k.split(':').map(Number); const d = Math.abs(a / b - w / hh); if (d < bd){ bd = d; best = k; } } p.aspect = best; p.size = Math.max(w, hh) > 1300 ? '1.5k' : '1k'; }
   }
   if (+par.batchSize === 4) p.batch = 4;
   if (par.negativePrompts) p.negative = String(par.negativePrompts);
   if (par.lora && typeof par.lora === 'object') p.loras = Object.entries(par.lora).slice(0, 5).map(([id, wt]) => ({id:String(id), w:+wt}));
-  if (par.inferenceProfile === 'ultra') p.profile = 'ultra';
+  if (par.inferenceProfile && par.inferenceProfile !== 'pro' || (par.inferenceProfile === 'pro' && fam(p) !== 'tsubaki3')) p.profile = String(par.inferenceProfile);
   if (par.priority != null) p.priority = String(par.priority);
   if (par.modelStyle && par.modelStyle.type === 'key') p.style = par.modelStyle.keyId; else if (par.modelStyle && par.modelStyle.type === 'custom'){ p.style = '__custom'; p.styleCustom = par.modelStyle.custom || ''; }
   if (par.colorPalette) p.palette = par.colorPalette;
   if (par.mediaId && par.strength != null && !par.enlarge){ p.i2i = {mediaId:String(par.mediaId)}; p.i2iStr = +par.strength; }
   if (Array.isArray(par.contextImages)) p.refs = par.contextImages.slice(0, 3).map(m => ({mediaId:String(m)}));
-  if (fam(p) === 'sdxl'){ if (par.samplingMethod) p.sampler = String(par.samplingMethod); if (par.samplingSteps != null && par.samplingSteps !== '') p.steps = String(par.samplingSteps); if (par.cfgScale != null && par.cfgScale !== '') p.cfg = String(par.cfgScale); }
+  const has = v => v != null && v !== '';
+  if (par.samplingMethod) p.sampler = String(par.samplingMethod);
+  if (has(par.samplingSteps)) p.steps = String(par.samplingSteps);
+  if (has(par.cfgScale)) p.cfg = String(par.cfgScale);
+  if (has(par.clipSkip)) p.clipSkip = String(par.clipSkip);
+  if (par.enableADetailer) p.adetailer = true;
+  if (+par.upscale > 1){ p.hires = String(par.upscale); if (has(par.upscaleDenoisingStrength)) p.hiresStr = +par.upscaleDenoisingStrength; }
   if (Array.isArray(par.controlNets)) p.cn = par.controlNets.map(c => ({type:c.type, mediaId:String(c.mediaId), weight:c.weight ?? 1}));
   return p;
 }
@@ -1606,12 +1762,17 @@ function viewSettings(){
     h('div', {class:'card stack'}, h('h3', {}, 'LoRA 라이브러리'), lib,
       h('div', {class:'row'}, h('button', {class:'nf', onclick:() => { LORAS.push({alias:'새 LoRA', id:'', trigger:'', w:0.6}); saveAll(); render(); }}, '+ 추가'),
         DESK ? h('button', {class:'nf', onclick:() => go('train')}, '내 학습 LoRA 불러오기') : null,
-        DESK ? h('button', {class:'nf', onclick:() => loraSearch(null)}, 'PixAI 마켓에서 찾기') : null, h('span', {class:'faint'}, '버전 ID = LoRA 모델 페이지에서 버전을 누른 뒤 URL 마지막 숫자. Tsubaki.3에는 DiT.3용만 붙습니다.'))),
+        DESK ? h('button', {class:'nf', onclick:() => loraSearch(null)}, 'PixAI 마켓에서 찾기') : null, h('span', {class:'faint'}, '버전 ID = LoRA 모델 페이지에서 버전을 누른 뒤 URL 마지막 숫자. LoRA는 만든 모델 계열에만 붙습니다(Tsubaki.3엔 DiT.3용).'))),
+    h('div', {class:'card stack'}, h('h3', {}, '내 모델'),
+      MYMODELS.length ? h('div', {class:'stack'}, ...MYMODELS.map((m, i) => h('div', {class:'row'}, h('span', {}, m.name), h('span', {class:'faint'}, `${typeName(m.type)} · 버전 ${m.id}`), h('span', {class:'sp'}),
+        h('button', {class:'sm nf', onclick:() => { MYMODELS.splice(i, 1); lsSet('pxs.models', MYMODELS); rebuildModels(); render(); }}, '목록에서 빼기'))))
+        : h('div', {class:'faint'}, '기본 목록(Tsubaki.3·Flash·Tsubaki.2·Haruka v2·Hoshino v2) 밖의 모델은 「모델 찾기」로 추가합니다.'),
+      DESK ? h('div', {class:'row'}, h('button', {class:'nf', onclick:() => modelSearch(null)}, '모델 찾기')) : null),
     h('div', {class:'card stack'}, h('h3', {}, '백업'),
       h('div', {class:'row'},
-        h('button', {class:'nf', onclick:() => download(new Blob([JSON.stringify({v:1, settings:Object.assign({}, S, {key:''}), loras:LORAS, projects:PROJECTS, single:SINGLE, scenesets:SCENESETS, charsets:CHARSETS}, null, 1)], {type:'application/json'}), 'pxstudio_backup.json')}, '설정·프로젝트 내보내기 (키 제외)'),
+        h('button', {class:'nf', onclick:() => download(new Blob([JSON.stringify({v:1, settings:Object.assign({}, S, {key:''}), loras:LORAS, models:MYMODELS, projects:PROJECTS, single:SINGLE, scenesets:SCENESETS, charsets:CHARSETS}, null, 1)], {type:'application/json'}), 'pxstudio_backup.json')}, '설정·프로젝트 내보내기 (키 제외)'),
         h('label', {class:'nf'}, h('button', {onclick:e => e.currentTarget.nextSibling.click()}, '가져오기'), h('input', {type:'file', accept:'.json', class:'hide', onchange:async e => {
-          try { const js = JSON.parse(await e.target.files[0].text()); if (js.loras) LORAS = js.loras; if (js.projects && js.projects.length){ PROJECTS = js.projects; CUR = PROJECTS[0].id; } if (js.single) SINGLE = js.single; if (Array.isArray(js.scenesets)) SCENESETS = normSets(js.scenesets); if (Array.isArray(js.charsets)) CHARSETS = normSets(js.charsets); if (js.settings){ const k = S.key; Object.assign(S, js.settings); S.key = k; } saveAll(); render(); alert('가져왔습니다.'); } catch (err){ alert('가져오기 실패: ' + err.message); }
+          try { const js = JSON.parse(await e.target.files[0].text()); if (js.loras) LORAS = js.loras; if (js.projects && js.projects.length){ PROJECTS = js.projects; CUR = PROJECTS[0].id; } if (js.single) SINGLE = js.single; if (Array.isArray(js.scenesets)) SCENESETS = normSets(js.scenesets); if (Array.isArray(js.charsets)) CHARSETS = normSets(js.charsets); if (Array.isArray(js.models)){ MYMODELS = js.models.filter(m => m && m.id); lsSet('pxs.models', MYMODELS); rebuildModels(); } if (js.settings){ const k = S.key; Object.assign(S, js.settings); S.key = k; } saveAll(); render(); alert('가져왔습니다.'); } catch (err){ alert('가져오기 실패: ' + err.message); }
         }}))),
       h('div', {class:'faint'}, '이미지는 백업에 포함되지 않습니다. 갤러리에서 ZIP으로 받아 두세요.')),
     h('div', {class:'faint'}, 'PX Studio는 PixAI와 무관한 비공식 도구입니다. 생성 비용·약관은 PixAI 계정 기준을 따릅니다.' + (MOCK ? ' · 지금은 테스트 모드(?mock)라 실제 호출을 하지 않습니다.' : '')));
